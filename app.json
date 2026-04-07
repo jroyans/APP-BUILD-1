@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "Vora",
+    "slug": "vora",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Vora uses your camera to record video diary entries.",
+          "microphonePermission": "Vora uses your microphone to record audio with your video entries.",
+          "recordAudioAndroid": true
+        }
+      ],
+      "expo-video",
+      "expo-location"
+    ],
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1F1F1F"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.vora.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1F1F1F"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "959bb0f0-b697-4022-bc97-38110bebbc58"
+      }
+    }
+  }
+}
