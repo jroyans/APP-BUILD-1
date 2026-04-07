@@ -1,5 +1,5 @@
-import { useRef, useState, useCallback, useEffect } from 'react';
-import { Alert, FlatList, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { Alert, Animated, FlatList, Modal, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { Directory, File, Paths } from 'expo-file-system/next';
 import * as Location from 'expo-location';
@@ -16,41 +16,183 @@ const COLORS = {
   accent: '#C86A4A',
   secondary: '#7A5C4D',
   text: '#F5F1E8',
+  rec: '#E63946',
+  surface: COLORS.surface,
 };
 
+const STAMP_FONT = 'Courier New';
+
 const Tab = createBottomTabNavigator();
+const RecordingContext = createContext({ isRecording: false, setIsRecording: () => {} });
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
-// ─── Tab icons ───────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function CameraIcon({ color }) {
-  return <View style={{ width: 22, height: 22, borderRadius: 11, backgroundColor: color }} />;
+function formatStampTime(timestamp) {
+  const d = new Date(timestamp);
+  const h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const ampm = h >= 12 ? 'pm' : 'am';
+  const hour = h % 12 || 12;
+  return `${hour}:${m}${ampm}`;
 }
+
+function formatStampDate(timestamp) {
+  return new Date(timestamp)
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    .toUpperCase()
+    .replace(',', '');
+}
+
+function formatCoords(location) {
+  if (!location) return '';
+  const { latitude: lat, longitude: lon } = location;
+  return `${Math.abs(lat).toFixed(1)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(1)}°${lon >= 0 ? 'E' : 'W'}`;
+}
+
+function formatClipNumber(n) {
+  return `■ ${String(n).padStart(4, '0')}`;
+}
+
+// ─── Tab icons ────────────────────────────────────────────────────────────────
 
 function FeedIcon({ color }) {
   return (
-    <View style={{ justifyContent: 'center', gap: 5 }}>
-      <View style={{ width: 22, height: 2, backgroundColor: color }} />
-      <View style={{ width: 22, height: 2, backgroundColor: color }} />
-      <View style={{ width: 22, height: 2, backgroundColor: color }} />
+    <View style={{ justifyContent: 'center', gap: 4 }}>
+      <View style={{ width: 18, height: 1.5, backgroundColor: color }} />
+      <View style={{ width: 18, height: 1.5, backgroundColor: color }} />
+      <View style={{ width: 18, height: 1.5, backgroundColor: color }} />
     </View>
   );
 }
 
-// ─── Camera screen (Slice 1 + 2, untouched) ──────────────────────────────────
+function RecordTabIcon() {
+  return (
+    <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: COLORS.accent }} />
+  );
+}
+
+function LocationPin({ color, size = 16 }) {
+  const circleSize = size * 0.65;
+  const triangleWidth = circleSize * 0.4;
+  const triangleHeight = circleSize * 0.5;
+  return (
+    <View style={{ alignItems: 'center' }}>
+      <View style={{
+        width: circleSize, height: circleSize, borderRadius: circleSize / 2,
+        backgroundColor: color,
+      }} />
+      <View style={{
+        width: 0, height: 0,
+        borderLeftWidth: triangleWidth,
+        borderRightWidth: triangleWidth,
+        borderTopWidth: triangleHeight,
+        borderLeftColor: 'transparent',
+        borderRightColor: 'transparent',
+        borderTopColor: color,
+        marginTop: -1,
+      }} />
+    </View>
+  );
+}
+
+function MapIcon({ color }) {
+  return (
+    <View style={{ width: 22, height: 22, alignItems: 'center', justifyContent: 'center' }}>
+      <LocationPin color={color} size={20} />
+    </View>
+  );
+}
+
+// ─── Map screen placeholder ───────────────────────────────────────────────────
+
+function MapScreen() {
+  return <View style={{ flex: 1, backgroundColor: COLORS.background }} />;
+}
+
+// ─── Camera screen ────────────────────────────────────────────────────────────
 
 function CameraScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
   const [locationPermission, requestLocationPermission] = Location.useForegroundPermissions();
   const [isRecording, setIsRecording] = useState(false);
+  const { setIsRecording: setGlobalRecording } = useContext(RecordingContext);
 
-  useEffect(() => {
-    console.log('requesting location permission');
-    requestLocationPermission();
-  }, []);
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+
+  const [locationStamp, setLocationStamp] = useState(null);
+  const [currentTime, setCurrentTime] = useState('');
+
+  const borderPulse = useRef(new Animated.Value(0)).current;
+  const recFlash = useRef(new Animated.Value(1)).current;
+  const recordTransition = useRef(new Animated.Value(0)).current;
+  const borderAnim = useRef(null);
+  const recAnim = useRef(null);
+
   const cameraRef = useRef(null);
   const isRecordingRef = useRef(false);
   const recordingStartTime = useRef(null);
+
+  useEffect(() => {
+    requestLocationPermission();
+  }, []);
+
+  // Live clock — functional setter skips re-render when formatted string is unchanged
+  useEffect(() => {
+    const update = () => {
+      const next = formatStampTime(Date.now());
+      setCurrentTime(prev => (prev === next ? prev : next));
+    };
+    update();
+    const timer = setInterval(update, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Capture location on screen entry for stamp display
+  useFocusEffect(
+    useCallback(() => {
+      getLocation().then(loc => { if (loc) setLocationStamp(loc); });
+    }, [])
+  );
+
+  // Button transition + pulsing border + REC flash animations
+  useEffect(() => {
+    return () => {
+      if (borderAnim.current) borderAnim.current.stop();
+      if (recAnim.current) recAnim.current.stop();
+    };
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(recordTransition, {
+      toValue: isRecording ? 1 : 0,
+      duration: 150,
+      useNativeDriver: false,
+    }).start();
+
+    if (isRecording) {
+      borderAnim.current = Animated.loop(
+        Animated.sequence([
+          Animated.timing(borderPulse, { toValue: 1, duration: 800, useNativeDriver: true }),
+          Animated.timing(borderPulse, { toValue: 0.3, duration: 800, useNativeDriver: true }),
+        ])
+      );
+      borderAnim.current.start();
+      recAnim.current = Animated.loop(
+        Animated.sequence([
+          Animated.timing(recFlash, { toValue: 0, duration: 500, useNativeDriver: true }),
+          Animated.timing(recFlash, { toValue: 1, duration: 500, useNativeDriver: true }),
+        ])
+      );
+      recAnim.current.start();
+    } else {
+      if (borderAnim.current) borderAnim.current.stop();
+      if (recAnim.current) recAnim.current.stop();
+      borderPulse.setValue(0);
+      recFlash.setValue(1);
+    }
+  }, [isRecording]);
 
   const getLocation = async () => {
     try {
@@ -99,6 +241,7 @@ function CameraScreen() {
       isRecordingRef.current = true;
       recordingStartTime.current = Date.now();
       setIsRecording(true);
+      setGlobalRecording(true);
       const locationPromise = getLocation();
       try {
         const result = await cameraRef.current.recordAsync();
@@ -111,6 +254,7 @@ function CameraScreen() {
       }
       isRecordingRef.current = false;
       setIsRecording(false);
+      setGlobalRecording(false);
     }
   };
 
@@ -141,16 +285,54 @@ function CameraScreen() {
     <View style={styles.container}>
       <CameraView
         ref={cameraRef}
-        style={StyleSheet.absoluteFill}
+        style={{ position: 'absolute', top: 0, left: 0, width: screenWidth, height: screenHeight }}
         mode="video"
         facing="back"
       />
-      <View style={styles.buttonRow}>
-        <Pressable
-          style={[styles.recordButton, isRecording && styles.recordButtonActive]}
+
+      <Animated.View
+        pointerEvents="none"
+        style={{
+          position: 'absolute',
+          top: 8, left: 8,
+          width: screenWidth - 16,
+          height: screenHeight - 16,
+          borderWidth: 6,
+          borderColor: COLORS.accent,
+          opacity: borderPulse,
+        }}
+      />
+
+      <View style={stampStyles.topLeft} pointerEvents="none">
+        <Animated.View style={[stampStyles.recRow, { opacity: isRecording ? recFlash : 0 }]}>
+          <View style={stampStyles.recDot} />
+          <Text style={stampStyles.recText}>REC</Text>
+        </Animated.View>
+        <Text style={stampStyles.time}>{currentTime}</Text>
+        {locationStamp ? (
+          <Text style={stampStyles.coords}>{formatCoords(locationStamp)}</Text>
+        ) : null}
+      </View>
+
+      <View style={[styles.buttonRow, { bottom: isRecording ? 100 : 40 }]}>
+        <AnimatedPressable
           onPressIn={startRecording}
           onPressOut={stopRecording}
-        />
+          style={[styles.recordOuter, {
+            backgroundColor: recordTransition.interpolate({
+              inputRange: [0, 1],
+              outputRange: ['transparent', COLORS.accent],
+            }),
+          }]}
+        >
+          <Animated.View style={[styles.recordInner, {
+            borderWidth: 3,
+            borderColor: recordTransition.interpolate({
+              inputRange: [0, 1],
+              outputRange: ['transparent', COLORS.background],
+            }),
+          }]} />
+        </AnimatedPressable>
       </View>
     </View>
   );
@@ -158,8 +340,8 @@ function CameraScreen() {
 
 // ─── Video player ─────────────────────────────────────────────────────────────
 
-function VideoPlayer({ uri, onClose }) {
-  const player = useVideoPlayer({ uri }, (p) => {
+function VideoPlayer({ clip, onClose }) {
+  const player = useVideoPlayer({ uri: clip.uri }, (p) => {
     p.play();
   });
 
@@ -169,9 +351,24 @@ function VideoPlayer({ uri, onClose }) {
         <VideoView
           player={player}
           style={playerStyles.video}
-          contentFit="contain"
+          contentFit="cover"
           nativeControls
         />
+
+        {/* State 3 camcorder stamp */}
+        <View style={stampStyles.topLeft} pointerEvents="none">
+          <Text style={stampStyles.time}>{formatStampTime(clip.timestamp)}</Text>
+          {clip.location ? (
+            <Text style={stampStyles.coords}>{formatCoords(clip.location)}</Text>
+          ) : null}
+        </View>
+        <View style={stampStyles.bottomLeft} pointerEvents="none">
+          <Text style={stampStyles.bottomStamp}>{formatClipNumber(clip.clipNumber)}</Text>
+        </View>
+        <View style={stampStyles.bottomRight} pointerEvents="none">
+          <Text style={stampStyles.bottomStamp}>{formatStampDate(clip.timestamp)}</Text>
+        </View>
+
         <Pressable style={playerStyles.closeButton} onPress={onClose}>
           <Text style={playerStyles.closeText}>Close</Text>
         </Pressable>
@@ -184,7 +381,7 @@ function VideoPlayer({ uri, onClose }) {
 
 function FeedScreen() {
   const [clips, setClips] = useState([]);
-  const [selectedUri, setSelectedUri] = useState(null);
+  const [selectedClip, setSelectedClip] = useState(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -252,6 +449,12 @@ function FeedScreen() {
     }
   };
 
+  const formatDuration = (duration) => {
+    if (duration == null) return null;
+    if (duration < 60) return `${duration}s`;
+    return `${Math.floor(duration / 60)}m ${duration % 60}s`;
+  };
+
   if (clips.length === 0) {
     return (
       <View style={[feedStyles.container, styles.centered]}>
@@ -262,24 +465,38 @@ function FeedScreen() {
 
   return (
     <View style={feedStyles.container}>
-      {selectedUri && (
-        <VideoPlayer uri={selectedUri} onClose={() => setSelectedUri(null)} />
+      {selectedClip && (
+        <VideoPlayer clip={selectedClip} onClose={() => setSelectedClip(null)} />
       )}
       <FlatList
         data={clips}
         keyExtractor={(item) => String(item.timestamp)}
         contentContainerStyle={feedStyles.list}
-        renderItem={({ item }) => (
-          <Pressable style={feedStyles.card} onPress={() => setSelectedUri(item.uri)}>
-            <View>
-              <Text style={feedStyles.cardText}>{formatDate(item.timestamp)}</Text>
-              {item.duration != null && (
-                <Text style={feedStyles.durationText}>{item.duration} sec</Text>
-              )}
+        renderItem={({ item, index }) => (
+          <Pressable
+            style={feedStyles.card}
+            onPress={() => setSelectedClip({ ...item, clipNumber: clips.length - index })}
+          >
+            <View style={feedStyles.cardMain}>
+              <View style={feedStyles.avatar}>
+                <Text style={feedStyles.avatarText}>Y</Text>
+              </View>
+              <View style={feedStyles.cardInfo}>
+                <Text style={feedStyles.username}>You</Text>
+                <Text style={feedStyles.cardDate}>{formatDate(item.timestamp)}</Text>
+                {item.duration != null && (
+                  <Text style={feedStyles.duration}>{formatDuration(item.duration)}</Text>
+                )}
+              </View>
             </View>
-            <Pressable onPress={() => deleteClip(item)} hitSlop={8}>
-              <Text style={feedStyles.deleteText}>Delete</Text>
-            </Pressable>
+            <View style={feedStyles.cardActions}>
+              <Pressable style={feedStyles.hereTooButton}>
+                <LocationPin color={COLORS.accent} size={18} />
+              </Pressable>
+              <Pressable onPress={() => deleteClip(item)} hitSlop={8} style={feedStyles.deleteButton}>
+                <Text style={feedStyles.deleteText}>Delete</Text>
+              </Pressable>
+            </View>
           </Pressable>
         )}
       />
@@ -290,33 +507,45 @@ function FeedScreen() {
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [isRecording, setIsRecording] = useState(false);
+
   return (
-    <NavigationContainer>
-      <Tab.Navigator
-        screenOptions={{
-          headerShown: false,
-          tabBarStyle: {
-            backgroundColor: COLORS.background,
-            borderTopColor: COLORS.secondary,
-            borderTopWidth: 1,
-          },
-          tabBarActiveTintColor: COLORS.accent,
-          tabBarInactiveTintColor: COLORS.secondary,
-          tabBarShowLabel: false,
-        }}
-      >
-        <Tab.Screen
-          name="Camera"
-          component={CameraScreen}
-          options={{ tabBarIcon: ({ color }) => <CameraIcon color={color} /> }}
-        />
-        <Tab.Screen
-          name="Feed"
-          component={FeedScreen}
-          options={{ tabBarIcon: ({ color }) => <FeedIcon color={color} /> }}
-        />
-      </Tab.Navigator>
-    </NavigationContainer>
+    <RecordingContext.Provider value={{ isRecording, setIsRecording }}>
+      <NavigationContainer>
+        <Tab.Navigator
+          screenOptions={{
+            headerShown: false,
+            tabBarStyle: isRecording
+              ? { display: 'none' }
+              : {
+                  backgroundColor: COLORS.background,
+                  borderTopColor: COLORS.surface,
+                  borderTopWidth: 0.5,
+                  height: 60,
+                },
+            tabBarActiveTintColor: COLORS.accent,
+            tabBarInactiveTintColor: 'rgba(245,241,232,0.4)',
+            tabBarShowLabel: false,
+          }}
+        >
+          <Tab.Screen
+            name="Feed"
+            component={FeedScreen}
+            options={{ tabBarIcon: ({ color }) => <FeedIcon color={color} /> }}
+          />
+          <Tab.Screen
+            name="Record"
+            component={CameraScreen}
+            options={{ tabBarIcon: () => <RecordTabIcon /> }}
+          />
+          <Tab.Screen
+            name="Map"
+            component={MapScreen}
+            options={{ tabBarIcon: ({ color }) => <MapIcon color={color} /> }}
+          />
+        </Tab.Navigator>
+      </NavigationContainer>
+    </RecordingContext.Provider>
   );
 }
 
@@ -352,21 +581,25 @@ const styles = StyleSheet.create({
   },
   buttonRow: {
     position: 'absolute',
-    bottom: 60,
     left: 0,
     right: 0,
     alignItems: 'center',
   },
-  recordButton: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: COLORS.accent,
+  recordOuter: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    borderWidth: 3,
+    borderColor: COLORS.accent,
+    backgroundColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  recordButtonActive: {
-    borderWidth: 4,
-    borderColor: COLORS.text,
-    transform: [{ scale: 1.15 }],
+  recordInner: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: COLORS.accent,
   },
 });
 
@@ -380,31 +613,74 @@ const feedStyles = StyleSheet.create({
     gap: 12,
   },
   card: {
-    backgroundColor: COLORS.secondary,
-    padding: 16,
+    backgroundColor: COLORS.surface,
+    borderRadius: 4,
+    padding: 14,
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
+    justifyContent: 'space-between',
   },
-  cardText: {
-    color: COLORS.text,
-    fontSize: 15,
+  cardMain: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    gap: 12,
   },
-  durationText: {
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: COLORS.secondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: {
     color: COLORS.text,
     fontSize: 12,
-    marginTop: 4,
-    opacity: 0.5,
+    fontWeight: '500',
+  },
+  cardInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  username: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  cardDate: {
+    color: COLORS.secondary,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  duration: {
+    color: COLORS.secondary,
+    fontSize: 12,
+  },
+  cardActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  hereTooButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    borderWidth: 1.5,
+    borderColor: COLORS.accent,
+    backgroundColor: 'rgba(200,106,74,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  deleteButton: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
   },
   deleteText: {
     color: COLORS.text,
-    fontSize: 12,
+    fontSize: 11,
     letterSpacing: 0.5,
-    opacity: 0.45,
-    borderWidth: 1,
-    borderColor: COLORS.text,
-    paddingVertical: 4,
-    paddingHorizontal: 10,
+    opacity: 0.4,
   },
   emptyText: {
     color: COLORS.text,
@@ -434,5 +710,65 @@ const playerStyles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 14,
     letterSpacing: 1,
+  },
+});
+
+const stampStyles = StyleSheet.create({
+  topLeft: {
+    position: 'absolute',
+    top: 60,
+    left: 16,
+  },
+  bottomLeft: {
+    position: 'absolute',
+    bottom: 40,
+    left: 16,
+  },
+  bottomRight: {
+    position: 'absolute',
+    bottom: 40,
+    right: 16,
+  },
+  recRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    marginBottom: 4,
+  },
+  recDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: COLORS.rec,
+  },
+  recText: {
+    fontFamily: STAMP_FONT,
+    fontSize: 11,
+    fontWeight: '500',
+    letterSpacing: 0.88,
+    color: COLORS.rec,
+  },
+  time: {
+    fontFamily: STAMP_FONT,
+    fontSize: 19,
+    fontWeight: '500',
+    letterSpacing: 0.95,
+    color: COLORS.accent,
+  },
+  coords: {
+    fontFamily: STAMP_FONT,
+    fontSize: 16,
+    fontWeight: '400',
+    letterSpacing: 0.64,
+    color: COLORS.accent,
+    opacity: 0.85,
+  },
+  bottomStamp: {
+    fontFamily: STAMP_FONT,
+    fontSize: 19,
+    fontWeight: '400',
+    letterSpacing: 1.14,
+    color: COLORS.accent,
+    opacity: 0.85,
   },
 });
