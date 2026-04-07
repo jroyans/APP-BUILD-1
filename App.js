@@ -5,7 +5,7 @@ import { Directory, File, Paths } from 'expo-file-system/next';
 import * as Location from 'expo-location';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { NavigationContainer } from '@react-navigation/native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { createBottomTabNavigator, BottomTabBar } from '@react-navigation/bottom-tabs';
 import { useFocusEffect } from '@react-navigation/native';
 
 const clipsDir = new Directory(Paths.document, 'clips');
@@ -17,14 +17,13 @@ const COLORS = {
   secondary: '#7A5C4D',
   text: '#F5F1E8',
   rec: '#E63946',
-  surface: COLORS.surface,
+  surface: '#2a2a2a',
 };
 
 const STAMP_FONT = 'Courier New';
 
 const Tab = createBottomTabNavigator();
 const RecordingContext = createContext({ isRecording: false, setIsRecording: () => {} });
-const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -124,10 +123,7 @@ function CameraScreen() {
   const [locationStamp, setLocationStamp] = useState(null);
   const [currentTime, setCurrentTime] = useState('');
 
-  const borderPulse = useRef(new Animated.Value(0)).current;
-  const recFlash = useRef(new Animated.Value(1)).current;
-  const recordTransition = useRef(new Animated.Value(0)).current;
-  const borderAnim = useRef(null);
+  const recFlash = useRef(new Animated.Value(0)).current;
   const recAnim = useRef(null);
 
   const cameraRef = useRef(null);
@@ -156,41 +152,22 @@ function CameraScreen() {
     }, [])
   );
 
-  // Button transition + pulsing border + REC flash animations
   useEffect(() => {
-    return () => {
-      if (borderAnim.current) borderAnim.current.stop();
-      if (recAnim.current) recAnim.current.stop();
-    };
+    return () => { if (recAnim.current) recAnim.current.stop(); };
   }, []);
 
   useEffect(() => {
-    Animated.timing(recordTransition, {
-      toValue: isRecording ? 1 : 0,
-      duration: 150,
-      useNativeDriver: false,
-    }).start();
-
     if (isRecording) {
-      borderAnim.current = Animated.loop(
-        Animated.sequence([
-          Animated.timing(borderPulse, { toValue: 1, duration: 800, useNativeDriver: true }),
-          Animated.timing(borderPulse, { toValue: 0.3, duration: 800, useNativeDriver: true }),
-        ])
-      );
-      borderAnim.current.start();
       recAnim.current = Animated.loop(
         Animated.sequence([
-          Animated.timing(recFlash, { toValue: 0, duration: 500, useNativeDriver: true }),
           Animated.timing(recFlash, { toValue: 1, duration: 500, useNativeDriver: true }),
+          Animated.timing(recFlash, { toValue: 0, duration: 500, useNativeDriver: true }),
         ])
       );
       recAnim.current.start();
     } else {
-      if (borderAnim.current) borderAnim.current.stop();
       if (recAnim.current) recAnim.current.stop();
-      borderPulse.setValue(0);
-      recFlash.setValue(1);
+      recFlash.setValue(0);
     }
   }, [isRecording]);
 
@@ -290,21 +267,9 @@ function CameraScreen() {
         facing="back"
       />
 
-      <Animated.View
-        pointerEvents="none"
-        style={{
-          position: 'absolute',
-          top: 8, left: 8,
-          width: screenWidth - 16,
-          height: screenHeight - 16,
-          borderWidth: 6,
-          borderColor: COLORS.accent,
-          opacity: borderPulse,
-        }}
-      />
 
       <View style={stampStyles.topLeft} pointerEvents="none">
-        <Animated.View style={[stampStyles.recRow, { opacity: isRecording ? recFlash : 0 }]}>
+        <Animated.View style={[stampStyles.recRow, { opacity: recFlash }]}>
           <View style={stampStyles.recDot} />
           <Text style={stampStyles.recText}>REC</Text>
         </Animated.View>
@@ -314,25 +279,14 @@ function CameraScreen() {
         ) : null}
       </View>
 
-      <View style={[styles.buttonRow, { bottom: isRecording ? 100 : 40 }]}>
-        <AnimatedPressable
+      <View style={styles.buttonRow}>
+        <Pressable
           onPressIn={startRecording}
           onPressOut={stopRecording}
-          style={[styles.recordOuter, {
-            backgroundColor: recordTransition.interpolate({
-              inputRange: [0, 1],
-              outputRange: ['transparent', COLORS.accent],
-            }),
-          }]}
+          style={isRecording ? styles.recordOuterActive : styles.recordOuter}
         >
-          <Animated.View style={[styles.recordInner, {
-            borderWidth: 3,
-            borderColor: recordTransition.interpolate({
-              inputRange: [0, 1],
-              outputRange: ['transparent', COLORS.background],
-            }),
-          }]} />
-        </AnimatedPressable>
+          <View style={isRecording ? styles.recordInnerActive : styles.recordInner} />
+        </Pressable>
       </View>
     </View>
   );
@@ -345,6 +299,39 @@ function VideoPlayer({ clip, onClose }) {
     p.play();
   });
 
+  const recFlash = useRef(new Animated.Value(1)).current;
+  const recAnim = useRef(null);
+
+  const startFlash = () => {
+    recAnim.current = Animated.loop(
+      Animated.sequence([
+        Animated.timing(recFlash, { toValue: 0, duration: 500, useNativeDriver: true }),
+        Animated.timing(recFlash, { toValue: 1, duration: 500, useNativeDriver: true }),
+      ])
+    );
+    recAnim.current.start();
+  };
+
+  const stopFlash = () => {
+    if (recAnim.current) recAnim.current.stop();
+    recFlash.setValue(1);
+  };
+
+  useEffect(() => {
+    startFlash();
+    const sub = player.addListener('playingChange', (event) => {
+      if (event.isPlaying) {
+        startFlash();
+      } else {
+        stopFlash();
+      }
+    });
+    return () => {
+      stopFlash();
+      sub.remove();
+    };
+  }, []);
+
   return (
     <Modal visible animationType="none" onRequestClose={onClose}>
       <View style={playerStyles.container}>
@@ -355,8 +342,11 @@ function VideoPlayer({ clip, onClose }) {
           nativeControls
         />
 
-        {/* State 3 camcorder stamp */}
         <View style={stampStyles.topLeft} pointerEvents="none">
+          <Animated.View style={[stampStyles.recRow, { opacity: recFlash }]}>
+            <View style={stampStyles.recDot} />
+            <Text style={stampStyles.recText}>REC</Text>
+          </Animated.View>
           <Text style={stampStyles.time}>{formatStampTime(clip.timestamp)}</Text>
           {clip.location ? (
             <Text style={stampStyles.coords}>{formatCoords(clip.location)}</Text>
@@ -504,6 +494,30 @@ function FeedScreen() {
   );
 }
 
+// ─── Animated tab bar ─────────────────────────────────────────────────────────
+
+function AnimatedTabBar(props) {
+  const { isRecording } = useContext(RecordingContext);
+  const translateY = useRef(new Animated.Value(0)).current;
+  const prevRecording = useRef(false);
+
+  useEffect(() => {
+    if (isRecording === prevRecording.current) return;
+    prevRecording.current = isRecording;
+    Animated.timing(translateY, {
+      toValue: isRecording ? 60 : 0,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+  }, [isRecording]);
+
+  return (
+    <Animated.View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, transform: [{ translateY }] }}>
+      <BottomTabBar {...props} />
+    </Animated.View>
+  );
+}
+
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -513,16 +527,16 @@ export default function App() {
     <RecordingContext.Provider value={{ isRecording, setIsRecording }}>
       <NavigationContainer>
         <Tab.Navigator
+          tabBar={props => <AnimatedTabBar {...props} />}
+          sceneContainerStyle={{ backgroundColor: 'transparent' }}
           screenOptions={{
             headerShown: false,
-            tabBarStyle: isRecording
-              ? { display: 'none' }
-              : {
-                  backgroundColor: COLORS.background,
-                  borderTopColor: COLORS.surface,
-                  borderTopWidth: 0.5,
-                  height: 60,
-                },
+            tabBarStyle: {
+              backgroundColor: COLORS.background,
+              borderTopColor: COLORS.surface,
+              borderTopWidth: 0.5,
+              height: 60,
+            },
             tabBarActiveTintColor: COLORS.accent,
             tabBarInactiveTintColor: 'rgba(245,241,232,0.4)',
             tabBarShowLabel: false,
@@ -581,6 +595,7 @@ const styles = StyleSheet.create({
   },
   buttonRow: {
     position: 'absolute',
+    bottom: 75,
     left: 0,
     right: 0,
     alignItems: 'center',
@@ -595,7 +610,23 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  recordOuterActive: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    borderWidth: 3,
+    borderColor: COLORS.text,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   recordInner: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: COLORS.accent,
+  },
+  recordInnerActive: {
     width: 72,
     height: 72,
     borderRadius: 36,
@@ -716,7 +747,7 @@ const playerStyles = StyleSheet.create({
 const stampStyles = StyleSheet.create({
   topLeft: {
     position: 'absolute',
-    top: 60,
+    top: 57,
     left: 16,
   },
   bottomLeft: {
@@ -736,14 +767,14 @@ const stampStyles = StyleSheet.create({
     marginBottom: 4,
   },
   recDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 3.5,
+    width: 8.5,
+    height: 8.5,
+    borderRadius: 4.25,
     backgroundColor: COLORS.rec,
   },
   recText: {
     fontFamily: STAMP_FONT,
-    fontSize: 11,
+    fontSize: 13,
     fontWeight: '500',
     letterSpacing: 0.88,
     color: COLORS.rec,
