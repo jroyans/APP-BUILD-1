@@ -6,6 +6,7 @@ import { useFocusEffect } from '@react-navigation/native';
 
 import { COLORS, RecordingContext, clipsDir, indexFile, formatStampTime, formatCoords, stampStyles } from './constants';
 import { File } from 'expo-file-system/next';
+import { supabase } from './supabase';
 
 export default function CameraScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -101,6 +102,37 @@ export default function CameraScreen() {
     clips.push(entry);
     indexFile.write(JSON.stringify(clips));
     console.log('Index updated, total clips:', clips.length, '| latest entry:', JSON.stringify(entry));
+
+    return { uri: destFile.uri, timestamp };
+  };
+
+  const uploadClip = async (localUri, timestamp, location, duration) => {
+    try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) throw userError ?? new Error('No user');
+
+      const blob = await fetch(localUri).then(r => r.blob());
+      const storagePath = `${user.id}/clip_${timestamp}.mp4`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('clips')
+        .upload(storagePath, blob, { contentType: 'video/mp4' });
+      if (uploadError) throw uploadError;
+
+      const { error: insertError } = await supabase.from('clips').insert({
+        user_id: user.id,
+        uri: storagePath,
+        timestamp,
+        duration,
+        latitude: location?.latitude ?? null,
+        longitude: location?.longitude ?? null,
+      });
+      if (insertError) throw insertError;
+
+      console.log('Cloud upload complete:', storagePath);
+    } catch (err) {
+      console.error('Cloud upload failed (local clip preserved):', err.message);
+    }
   };
 
   const handleRequestPermissions = async () => {
@@ -121,7 +153,8 @@ export default function CameraScreen() {
         const location = await locationPromise;
         const duration = Math.round((Date.now() - recordingStartTime.current) / 1000);
         console.log('Duration:', duration, 'seconds');
-        await saveClip(result.uri, location, duration);
+        const { uri: localUri, timestamp } = await saveClip(result.uri, location, duration);
+        uploadClip(localUri, timestamp, location, duration);
       } catch (error) {
         console.error('Recording error:', error);
       }

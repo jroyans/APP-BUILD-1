@@ -5,6 +5,7 @@ import { useFocusEffect } from '@react-navigation/native';
 
 import { COLORS, indexFile, LocationPin } from './constants';
 import VideoPlayer from './VideoPlayer';
+import { supabase } from './supabase';
 
 export default function FeedScreen() {
   const [clips, setClips] = useState([]);
@@ -19,14 +20,33 @@ export default function FeedScreen() {
   const loadClips = async () => {
     if (!indexFile.exists) {
       setClips([]);
-      return;
+    } else {
+      try {
+        const raw = await indexFile.text();
+        const parsed = JSON.parse(raw);
+        setClips([...parsed].reverse());
+      } catch (_) {
+        setClips([]);
+      }
     }
+    syncCloudClips();
+  };
+
+  const syncCloudClips = async () => {
     try {
-      const raw = await indexFile.text();
-      const parsed = JSON.parse(raw);
-      setClips([...parsed].reverse());
-    } catch (_) {
-      setClips([]);
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) return;
+
+      const { data, error } = await supabase
+        .from('clips')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('timestamp', { ascending: false });
+
+      if (error) throw error;
+      console.log('Cloud clips:', data);
+    } catch (err) {
+      console.error('Cloud sync failed:', err.message);
     }
   };
 
@@ -44,12 +64,38 @@ export default function FeedScreen() {
             const updated = parsed.filter((c) => c.timestamp !== item.timestamp);
             indexFile.write(JSON.stringify(updated));
             setClips((prev) => prev.filter((c) => c.timestamp !== item.timestamp));
+            deleteCloudClip(item);
           } catch (_) {
             Alert.alert('Error', 'Could not delete the clip. Please try again.');
           }
         },
       },
     ]);
+  };
+
+  const deleteCloudClip = async (item) => {
+    try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) return;
+
+      const storagePath = `${user.id}/clip_${item.timestamp}.mp4`;
+
+      const { error: storageError } = await supabase.storage
+        .from('clips')
+        .remove([storagePath]);
+      if (storageError) throw storageError;
+
+      const { error: dbError } = await supabase
+        .from('clips')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('timestamp', item.timestamp);
+      if (dbError) throw dbError;
+
+      console.log('Cloud clip deleted:', storagePath);
+    } catch (err) {
+      console.error('Cloud delete failed (local delete succeeded):', err.message);
+    }
   };
 
   const formatDate = (timestamp) => {
