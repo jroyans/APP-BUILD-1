@@ -1,9 +1,11 @@
 import { useContext, useEffect, useRef, useState } from 'react';
-import { Animated, View } from 'react-native';
+import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator, BottomTabBar } from '@react-navigation/bottom-tabs';
 
 import { COLORS, RecordingContext, LocationPin } from './constants';
+import { supabase } from './supabase';
+import AuthScreen from './AuthScreen';
 import CameraScreen from './CameraScreen';
 import FeedScreen from './FeedScreen';
 import MapScreen from './MapScreen';
@@ -64,6 +66,27 @@ function AnimatedTabBar(props) {
 
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
+  const [session, setSession] = useState(undefined);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session ?? null);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session ?? null);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return <View style={{ flex: 1, backgroundColor: COLORS.background }} />;
+  }
+
+  if (session === null) {
+    return <AuthScreen onAuth={() => {}} />;
+  }
 
   return (
     <RecordingContext.Provider value={{ isRecording, setIsRecording }}>
@@ -101,6 +124,26 @@ export default function App() {
           />
         </Tab.Navigator>
       </NavigationContainer>
+      <Pressable style={appStyles.signOut} onPress={() => supabase.auth.signOut()}>
+        <Text style={appStyles.signOutText}>Sign out</Text>
+      </Pressable>
     </RecordingContext.Provider>
   );
 }
+
+const appStyles = StyleSheet.create({
+  signOut: {
+    position: 'absolute',
+    top: 60,
+    right: 16,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: COLORS.secondary,
+  },
+  signOutText: {
+    color: COLORS.secondary,
+    fontSize: 11,
+    letterSpacing: 0.5,
+  },
+});
