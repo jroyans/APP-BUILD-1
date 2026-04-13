@@ -5,7 +5,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { COLORS, STAMP_FONT, formatStampTime, formatStampDate, formatCoords, formatClipNumber, stampStyles } from './constants';
 
 export default function VideoPlayer({ clip, onClose }) {
-  const player = useVideoPlayer({ uri: clip.uri }, (p) => {
+  const player = useVideoPlayer({ uri: clip.playbackUri ?? clip.uri }, (p) => {
     p.play();
   });
 

@@ -41,6 +41,9 @@ Entry point is `App.js` → `index.js`. The `app/`, `components/`, `hooks/`, `co
 - `expo-video` — `useVideoPlayer` + `VideoView`. Do NOT use expo-av.
 - `expo-location` — `useForegroundPermissions` + `Location.getCurrentPositionAsync`
 - `@react-navigation/bottom-tabs` — three tab navigation: Feed, Record, Map
+CRITICAL: All binary file uploads to Supabase Storage must use ArrayBuffer approach — 
+blob uploads produce empty files in React Native. See uploadClip in CameraScreen.js 
+for the working pattern.
 
 ---
 
@@ -65,8 +68,8 @@ Stamp font: `Courier New, Courier, monospace`
 - Slice 1 ✅ — recording, local storage, feed, delete, location, dates, duration
 - Slice 8 ⏸️ — EAS production build pending Apple Developer account
 
-### Version 2 — In Progress
-- V2 Slice 1 ✅ — design polish, three-tab nav, camcorder stamps, component split
+### Version 2 
+- V2 Slice 1 — design polish, three-tab nav, camcorder stamps, component split
 - V2 Slice 2 — Supabase setup and user accounts (next)
 - V2 Slice 3 — cloud clip storage
 - V2 Slice 4 — map screen

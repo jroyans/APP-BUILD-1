@@ -7,6 +7,8 @@ import { useFocusEffect } from '@react-navigation/native';
 import { COLORS, RecordingContext, clipsDir, indexFile, formatStampTime, formatCoords, stampStyles } from './constants';
 import { File } from 'expo-file-system/next';
 import { supabase } from './supabase';
+import * as VideoThumbnails from 'expo-video-thumbnails';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 
 export default function CameraScreen() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -111,25 +113,64 @@ export default function CameraScreen() {
       const { data: { user }, error: userError } = await supabase.auth.getUser();
       if (userError || !user) throw userError ?? new Error('No user');
 
-      const blob = await fetch(localUri).then(r => r.blob());
+      const base64 = await FileSystemLegacy.readAsStringAsync(localUri, { encoding: 'base64' });
+      const binaryString = atob(base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
       const storagePath = `${user.id}/clip_${timestamp}.mp4`;
 
       const { error: uploadError } = await supabase.storage
         .from('clips')
-        .upload(storagePath, blob, { contentType: 'video/mp4' });
+        .upload(storagePath, bytes.buffer, { contentType: 'video/mp4' });
       if (uploadError) throw uploadError;
 
-      const { error: insertError } = await supabase.from('clips').insert({
+      const { data: insertData, error: insertError } = await supabase.from('clips').insert({
         user_id: user.id,
         uri: storagePath,
         timestamp,
         duration,
         latitude: location?.latitude ?? null,
         longitude: location?.longitude ?? null,
-      });
+      }).select();
       if (insertError) throw insertError;
 
+      const insertedClip = insertData[0];
       console.log('Cloud upload complete:', storagePath);
+
+      // Thumbnail — generated from local file while it's still on device
+      try {
+        const thumbnailResult = await VideoThumbnails.getThumbnailAsync(localUri, { time: 0 });
+        console.log('Thumbnail URI:', thumbnailResult.uri);
+
+        const base64 = await FileSystemLegacy.readAsStringAsync(thumbnailResult.uri, { encoding: 'base64' });
+        console.log('Base64 length:', base64.length);
+        console.log('Base64 preview:', base64.slice(0, 100));
+        const binaryString = atob(base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        const thumbPath = `${user.id}/thumb_${timestamp}.jpg`;
+
+        const { error: thumbUploadError } = await supabase.storage
+          .from('thumbnails')
+          .upload(thumbPath, bytes.buffer, { contentType: 'image/jpeg', upsert: true });
+        if (thumbUploadError) throw thumbUploadError;
+
+        const publicUrl = supabase.storage.from('thumbnails').getPublicUrl(thumbPath).data.publicUrl;
+
+        const { error: thumbUpdateError } = await supabase.from('clips')
+          .update({ thumbnail_url: publicUrl })
+          .eq('id', insertedClip.id);
+        if (thumbUpdateError) throw thumbUpdateError;
+
+        console.log('Thumbnail uploaded and linked:', thumbPath);
+      } catch (thumbErr) {
+        console.error('Thumbnail failed (clip preserved):', thumbErr.message);
+      }
     } catch (err) {
       console.error('Cloud upload failed (local clip preserved):', err.message);
     }
