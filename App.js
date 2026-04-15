@@ -1,9 +1,10 @@
 import { useContext, useEffect, useRef, useState } from 'react';
-import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Animated, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator, BottomTabBar } from '@react-navigation/bottom-tabs';
+import { Ionicons } from '@expo/vector-icons';
 
-import { COLORS, RecordingContext, LocationPin } from './constants';
+import { COLORS, RecordingContext } from './constants';
 import { supabase } from './supabase';
 import AuthScreen from './AuthScreen';
 import CameraScreen from './CameraScreen';
@@ -31,11 +32,7 @@ function RecordTabIcon() {
 }
 
 function MapIcon({ color }) {
-  return (
-    <View style={{ width: 22, height: 22, alignItems: 'center', justifyContent: 'center' }}>
-      <LocationPin color={color} size={20} />
-    </View>
-  );
+  return <Ionicons name="person-circle" size={24} color={color} />;
 }
 
 // ─── Animated tab bar ─────────────────────────────────────────────────────────
@@ -124,26 +121,6 @@ export default function App() {
           />
         </Tab.Navigator>
       </NavigationContainer>
-      <Pressable style={appStyles.signOut} onPress={() => supabase.auth.signOut()}>
-        <Text style={appStyles.signOutText}>Sign out</Text>
-      </Pressable>
     </RecordingContext.Provider>
   );
 }
-
-const appStyles = StyleSheet.create({
-  signOut: {
-    position: 'absolute',
-    top: 60,
-    right: 16,
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderWidth: 1,
-    borderColor: COLORS.secondary,
-  },
-  signOutText: {
-    color: COLORS.secondary,
-    fontSize: 11,
-    letterSpacing: 0.5,
-  },
-});

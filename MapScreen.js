@@ -1,12 +1,13 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { Alert, Image, Modal, PanResponder, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { Alert, Image, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import MapView, { Marker } from 'react-native-maps';
-import { useVideoPlayer, VideoView } from 'expo-video';
 import * as VideoThumbnails from 'expo-video-thumbnails';
 import { COLORS } from './constants';
 import { supabase } from './supabase';
 import VideoPlayer from './VideoPlayer';
+import CircleScreen from './CircleScreen';
 
 const CLUSTER_THRESHOLD = 0.001;
 const STAMP_FONT = 'Courier New';
@@ -105,80 +106,29 @@ function ClusterPin({ thumbnailUri, count }) {
   );
 }
 
-// --- Cluster player ---
+// --- Settings modal ---
 
-function ClipVideo({ uri: playbackUri }) {
-  console.log('ClipVideo received uri:', playbackUri);
-  const player = useVideoPlayer(playbackUri, p => {
-    p.loop = true;
-    p.play();
-  });
-  return (
-    <VideoView
-      player={player}
-      style={{ flex: 1 }}
-      contentFit="cover"
-      nativeControls
-    />
-  );
-}
-
-function ClusterPlayer({ cluster, initialIndex, onClose, onIndexChange }) {
-  const [index, setIndex] = useState(initialIndex);
-  const { width: screenWidth } = useWindowDimensions();
-  const edgeWidth = screenWidth * 0.2;
-  const indexRef = useRef(initialIndex);
-
-  const goRef = useRef(null);
-  goRef.current = (delta) => {
-    const next = Math.max(0, Math.min(cluster.clips.length - 1, indexRef.current + delta));
-    if (next === indexRef.current) return;
-    indexRef.current = next;
-    setIndex(next);
-    onIndexChange(next);
+function SettingsModal({ visible, onClose }) {
+  const handleSignOut = async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.error('Sign out failed:', err.message);
+    }
   };
 
-  const makePan = () =>
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderRelease: (_, gs) => {
-        if (Math.abs(gs.dx) > 30 && Math.abs(gs.dx) > Math.abs(gs.dy)) {
-          goRef.current(gs.dx < 0 ? 1 : -1);
-        }
-      },
-    });
-
-  const leftPan = useRef(makePan()).current;
-  const rightPan = useRef(makePan()).current;
-
-  const clip = cluster.clips[index];
-
   return (
-    <Modal visible animationType="none" onRequestClose={onClose}>
-      <View style={{ flex: 1, backgroundColor: '#000' }}>
-        <ClipVideo key={clip.id} uri={clip.playbackUri} />
-
-        {/* Left edge zone — 20% width, captures swipe gestures only */}
-        <View
-          style={[clusterStyles.edgeZone, { left: 0, width: edgeWidth }]}
-          {...leftPan.panHandlers}
-        />
-        {/* Right edge zone — 20% width, captures swipe gestures only */}
-        <View
-          style={[clusterStyles.edgeZone, { right: 0, width: edgeWidth }]}
-          {...rightPan.panHandlers}
-        />
-
-        <View style={clusterStyles.indicator}>
-          <Text style={clusterStyles.indicatorText}>
-            {index + 1} of {cluster.clips.length}
-          </Text>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={settingsModalStyles.overlay}>
+        <View style={settingsModalStyles.card}>
+          <Text style={settingsModalStyles.title}>settings</Text>
+          <Pressable style={settingsModalStyles.signOutButton} onPress={handleSignOut}>
+            <Text style={settingsModalStyles.signOutText}>sign out</Text>
+          </Pressable>
+          <Pressable onPress={onClose}>
+            <Text style={settingsModalStyles.cancelText}>cancel</Text>
+          </Pressable>
         </View>
-
-        <Pressable style={clusterStyles.closeButton} onPress={onClose}>
-          <Text style={clusterStyles.closeText}>Close</Text>
-        </Pressable>
       </View>
     </Modal>
   );
@@ -186,25 +136,8 @@ function ClusterPlayer({ cluster, initialIndex, onClose, onIndexChange }) {
 
 // --- Profile card ---
 
-function PersonIcon() {
-  return (
-    <View style={{ alignItems: 'center' }}>
-      <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#fff' }} />
-      <View style={{ width: 12, height: 7, borderTopLeftRadius: 6, borderTopRightRadius: 6, backgroundColor: '#fff', marginTop: 1 }} />
-    </View>
-  );
-}
 
-function PencilIcon() {
-  return (
-    <View style={{ alignItems: 'center', justifyContent: 'center', width: 14, height: 14 }}>
-      <View style={{ width: 2, height: 10, backgroundColor: '#fff', transform: [{ rotate: '45deg' }], position: 'absolute' }} />
-      <View style={{ width: 4, height: 4, backgroundColor: '#fff', position: 'absolute', bottom: 0, transform: [{ rotate: '45deg' }] }} />
-    </View>
-  );
-}
-
-function ProfileCard({ profile, momentCount, totalDuration }) {
+function ProfileCard({ profile, momentCount, totalDuration, circleCount, onCirclePress, onSettingsPress }) {
   const initials = getInitials(profile?.full_name, profile?.username);
   const displayName = profile?.full_name || profile?.username || '—';
   const location = profile?.home_location || 'Adelaide, Australia';
@@ -214,13 +147,12 @@ function ProfileCard({ profile, momentCount, totalDuration }) {
       {/* Avatar row */}
       <View style={styles.avatarRow}>
         {/* Avatar with circle badge */}
-        <View style={{ position: 'relative', marginRight: 12 }}>
+        <View style={{ width: 42, height: 42, marginRight: 13 }}>
           <View style={styles.avatar}>
             <Text style={styles.avatarInitials}>{initials}</Text>
           </View>
-          {/* TODO: connect to Circle count in Slice 6 */}
           <View style={styles.circleBadge}>
-            <Text style={styles.circleBadgeText}>0</Text>
+            <Text style={styles.circleBadgeText}>{circleCount}</Text>
           </View>
         </View>
 
@@ -232,17 +164,11 @@ function ProfileCard({ profile, momentCount, totalDuration }) {
 
         {/* Icon buttons */}
         <View style={styles.iconRow}>
-          <Pressable
-            style={styles.iconButtonSecondary}
-            onPress={() => console.log('manage circle')}
-          >
-            <PersonIcon />
+          <Pressable style={styles.iconButtonSecondary} onPress={onCirclePress}>
+            <Ionicons name="people" size={20} color="#fff" />
           </Pressable>
-          <Pressable
-            style={styles.iconButtonAccent}
-            onPress={() => console.log('edit profile')}
-          >
-            <PencilIcon />
+          <Pressable style={styles.iconButtonAccent} onPress={onSettingsPress}>
+            <Ionicons name="settings" size={20} color="#fff" />
           </Pressable>
         </View>
       </View>
@@ -269,9 +195,26 @@ export default function MapScreen() {
   const [clips, setClips] = useState([]);
   const [profile, setProfile] = useState(null);
   const [allClips, setAllClips] = useState([]);
+  const [circleCount, setCircleCount] = useState(0);
+  const [showCircle, setShowCircle] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [selectedSingleClip, setSelectedSingleClip] = useState(null);
-  const [selectedCluster, setSelectedCluster] = useState(null);
-  const lastViewedIndex = useRef({});
+  const [selectedClips, setSelectedClips] = useState(null);
+  const currentUserIdRef = useRef(null);
+
+  const refreshClips = useCallback(async () => {
+    if (!currentUserIdRef.current) return;
+    try {
+      const { data } = await supabase.from('clips').select('*').eq('user_id', currentUserIdRef.current);
+      const all = data ?? [];
+      setAllClips(all);
+      const located = all.filter(c => c.latitude != null && c.longitude != null);
+      const withThumb = located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null }));
+      setClips(withThumb);
+    } catch (err) {
+      console.error('Clips refresh failed:', err.message);
+    }
+  }, []);
 
   const clusters = useMemo(() => buildClusters(clips), [clips]);
 
@@ -284,13 +227,16 @@ export default function MapScreen() {
         try {
           const { data: { user }, error: userError } = await supabase.auth.getUser();
           if (userError || !user) throw userError ?? new Error('No user');
+          currentUserIdRef.current = user.id;
 
-          const [profileResult, clipsResult] = await Promise.all([
+          const [profileResult, clipsResult, circleResult] = await Promise.all([
             supabase.from('profiles').select('*').eq('id', user.id).single(),
             supabase.from('clips').select('*').eq('user_id', user.id),
+            supabase.from('circles').select('id').eq('user_id', user.id),
           ]);
 
           if (profileResult.data) setProfile(profileResult.data);
+          setCircleCount((circleResult.data ?? []).length);
 
           const data = clipsResult.data ?? [];
           setAllClips(data);
@@ -380,12 +326,8 @@ export default function MapScreen() {
       return;
     }
 
-    const initialIndex = Math.min(lastViewedIndex.current[cluster.id] ?? 0, resolvedClips.length - 1);
-    if (resolvedClips.length === 1) {
-      setSelectedSingleClip(resolvedClips[0]);
-    } else {
-      setSelectedCluster({ ...cluster, clips: resolvedClips, startIndex: initialIndex });
-    }
+    setSelectedSingleClip(resolvedClips[0]);
+    setSelectedClips(resolvedClips.length > 1 ? resolvedClips : null);
   };
 
   return (
@@ -428,21 +370,28 @@ export default function MapScreen() {
         profile={profile}
         momentCount={momentCount}
         totalDuration={totalDuration}
+        circleCount={circleCount}
+        onCirclePress={() => setShowCircle(true)}
+        onSettingsPress={() => setShowSettings(true)}
+      />
+      <SettingsModal visible={showSettings} onClose={() => setShowSettings(false)} />
+
+      <CircleScreen
+        visible={showCircle}
+        onClose={() => setShowCircle(false)}
+        onCircleChanged={() => {
+          supabase.from('circles').select('id').eq('user_id', profile?.id).then(({ data }) => {
+            setCircleCount((data ?? []).length);
+          });
+        }}
       />
 
       {selectedSingleClip ? (
         <VideoPlayer
           clip={selectedSingleClip}
-          onClose={() => setSelectedSingleClip(null)}
-        />
-      ) : null}
-
-      {selectedCluster ? (
-        <ClusterPlayer
-          cluster={selectedCluster}
-          initialIndex={selectedCluster.startIndex}
-          onClose={() => setSelectedCluster(null)}
-          onIndexChange={(i) => { lastViewedIndex.current[selectedCluster.id] = i; }}
+          clips={selectedClips}
+          onClose={() => { setSelectedSingleClip(null); setSelectedClips(null); }}
+          onDelete={refreshClips}
         />
       ) : null}
     </View>
@@ -512,41 +461,6 @@ const clusterPinStyles = StyleSheet.create({
   },
 });
 
-const clusterStyles = StyleSheet.create({
-  edgeZone: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-  },
-  indicator: {
-    position: 'absolute',
-    bottom: 40,
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-  },
-  indicatorText: {
-    color: COLORS.text,
-    fontSize: 12,
-    opacity: 0.7,
-    letterSpacing: 1,
-  },
-  closeButton: {
-    position: 'absolute',
-    top: 60,
-    right: 24,
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderWidth: 1,
-    borderColor: COLORS.secondary,
-  },
-  closeText: {
-    color: COLORS.text,
-    fontSize: 14,
-    letterSpacing: 1,
-  },
-});
-
 const styles = StyleSheet.create({
   profileCard: {
     position: 'absolute',
@@ -554,36 +468,36 @@ const styles = StyleSheet.create({
     left: 12,
     right: 12,
     backgroundColor: 'rgba(31,31,31,0.92)',
-    borderRadius: 14,
+    borderRadius: 15,
     borderWidth: 0.5,
     borderColor: '#333330',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingVertical: 13,
+    paddingHorizontal: 18,
   },
   avatarRow: {
     flexDirection: 'row',
     alignItems: 'center',
   },
   avatar: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     backgroundColor: COLORS.secondary,
     alignItems: 'center',
     justifyContent: 'center',
   },
   avatarInitials: {
     color: COLORS.text,
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '500',
   },
   circleBadge: {
     position: 'absolute',
     bottom: 0,
     right: 0,
-    width: 16,
-    height: 16,
-    borderRadius: 8,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
     backgroundColor: '#1F1F1F',
     borderWidth: 1,
     borderColor: COLORS.accent,
@@ -592,36 +506,36 @@ const styles = StyleSheet.create({
   },
   circleBadgeText: {
     color: COLORS.accent,
-    fontSize: 8,
+    fontSize: 9,
     fontFamily: STAMP_FONT,
-    lineHeight: 10,
+    lineHeight: 11,
   },
   name: {
     color: COLORS.text,
-    fontSize: 15,
+    fontSize: 17,
     fontWeight: '500',
   },
   location: {
     color: COLORS.secondary,
-    fontSize: 11,
+    fontSize: 12,
     marginTop: 1,
   },
   iconRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 9,
   },
   iconButtonSecondary: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: COLORS.secondary,
     alignItems: 'center',
     justifyContent: 'center',
   },
   iconButtonAccent: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
@@ -629,7 +543,7 @@ const styles = StyleSheet.create({
   divider: {
     height: 0.5,
     backgroundColor: '#333330',
-    marginVertical: 10,
+    marginVertical: 11,
   },
   statsRow: {
     flexDirection: 'row',
@@ -637,13 +551,55 @@ const styles = StyleSheet.create({
   },
   stat: {
     color: COLORS.accent,
-    fontSize: 11,
+    fontSize: 12,
     fontFamily: STAMP_FONT,
-    letterSpacing: 0.04 * 11,
+    letterSpacing: 0.04 * 12,
   },
   statDot: {
     color: COLORS.accent,
-    fontSize: 11,
+    fontSize: 12,
     fontFamily: STAMP_FONT,
+  },
+});
+
+const settingsModalStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  card: {
+    backgroundColor: '#1F1F1F',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#333330',
+    padding: 24,
+    width: '80%',
+  },
+  title: {
+    color: '#F5F1E8',
+    fontSize: 15,
+    fontWeight: '500',
+    fontFamily: 'Courier New',
+    marginBottom: 20,
+  },
+  signOutButton: {
+    backgroundColor: '#2a2a2a',
+    borderRadius: 10,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  signOutText: {
+    color: '#E63946',
+    fontSize: 14,
+    fontFamily: 'Courier New',
+  },
+  cancelText: {
+    color: '#7A5C4D',
+    fontSize: 13,
+    fontFamily: 'Courier New',
+    textAlign: 'center',
   },
 });

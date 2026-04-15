@@ -1,9 +1,8 @@
 import { useCallback, useState } from 'react';
-import { Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
-import { File } from 'expo-file-system/next';
+import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 
-import { COLORS, indexFile, LocationPin } from './constants';
+import { COLORS, LocationPin } from './constants';
 import VideoPlayer from './VideoPlayer';
 import { supabase } from './supabase';
 
@@ -18,83 +17,34 @@ export default function FeedScreen() {
   );
 
   const loadClips = async () => {
-    if (!indexFile.exists) {
-      setClips([]);
-    } else {
-      try {
-        const raw = await indexFile.text();
-        const parsed = JSON.parse(raw);
-        setClips([...parsed].reverse());
-      } catch (_) {
-        setClips([]);
-      }
-    }
-    syncCloudClips();
-  };
-
-  const syncCloudClips = async () => {
     try {
       const { data: { user }, error: userError } = await supabase.auth.getUser();
       if (userError || !user) return;
+
+      const { data: circleRows, error: circleError } = await supabase
+        .from('circles')
+        .select('circle_member_id')
+        .eq('user_id', user.id);
+      if (circleError) throw circleError;
+
+      const memberIds = (circleRows ?? []).map(r => r.circle_member_id);
+
+      if (memberIds.length === 0) {
+        setClips([]);
+        return;
+      }
 
       const { data, error } = await supabase
         .from('clips')
         .select('*')
-        .eq('user_id', user.id)
+        .in('user_id', memberIds)
         .order('timestamp', { ascending: false });
-
       if (error) throw error;
-      console.log('Cloud clips:', data);
+
+      setClips(data ?? []);
     } catch (err) {
-      console.error('Cloud sync failed:', err.message);
-    }
-  };
-
-  const deleteClip = (item) => {
-    Alert.alert('Delete this clip?', undefined, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            new File(item.uri).delete();
-            const raw = await indexFile.text();
-            const parsed = JSON.parse(raw);
-            const updated = parsed.filter((c) => c.timestamp !== item.timestamp);
-            indexFile.write(JSON.stringify(updated));
-            setClips((prev) => prev.filter((c) => c.timestamp !== item.timestamp));
-            deleteCloudClip(item);
-          } catch (_) {
-            Alert.alert('Error', 'Could not delete the clip. Please try again.');
-          }
-        },
-      },
-    ]);
-  };
-
-  const deleteCloudClip = async (item) => {
-    try {
-      const { data: { user }, error: userError } = await supabase.auth.getUser();
-      if (userError || !user) return;
-
-      const storagePath = `${user.id}/clip_${item.timestamp}.mp4`;
-
-      const { error: storageError } = await supabase.storage
-        .from('clips')
-        .remove([storagePath]);
-      if (storageError) throw storageError;
-
-      const { error: dbError } = await supabase
-        .from('clips')
-        .delete()
-        .eq('user_id', user.id)
-        .eq('timestamp', item.timestamp);
-      if (dbError) throw dbError;
-
-      console.log('Cloud clip deleted:', storagePath);
-    } catch (err) {
-      console.error('Cloud delete failed (local delete succeeded):', err.message);
+      console.error('Feed load failed:', err.message);
+      setClips([]);
     }
   };
 
@@ -131,7 +81,7 @@ export default function FeedScreen() {
   if (clips.length === 0) {
     return (
       <View style={[feedStyles.container, feedStyles.centered]}>
-        <Text style={feedStyles.emptyText}>No clips yet.</Text>
+        <Text style={feedStyles.emptyText}>add someone to your circle to see their moments</Text>
       </View>
     );
   }
@@ -143,19 +93,26 @@ export default function FeedScreen() {
       )}
       <FlatList
         data={clips}
-        keyExtractor={(item) => String(item.timestamp)}
+        keyExtractor={(item) => String(item.id ?? item.timestamp)}
         contentContainerStyle={feedStyles.list}
         renderItem={({ item, index }) => (
           <Pressable
             style={feedStyles.card}
-            onPress={() => setSelectedClip({ ...item, clipNumber: clips.length - index })}
+            onPress={async () => {
+              try {
+                const { data, error } = await supabase.storage.from('clips').createSignedUrl(item.uri, 3600);
+                if (error) throw error;
+                setSelectedClip({ ...item, playbackUri: data.signedUrl });
+              } catch (err) {
+                console.error('Failed to get signed URL:', err.message);
+              }
+            }}
           >
             <View style={feedStyles.cardMain}>
               <View style={feedStyles.avatar}>
-                <Text style={feedStyles.avatarText}>Y</Text>
+                <Text style={feedStyles.avatarText}>·</Text>
               </View>
               <View style={feedStyles.cardInfo}>
-                <Text style={feedStyles.username}>You</Text>
                 <Text style={feedStyles.cardDate}>{formatDate(item.timestamp)}</Text>
                 {item.duration != null && (
                   <Text style={feedStyles.duration}>{formatDuration(item.duration)}</Text>
@@ -165,9 +122,6 @@ export default function FeedScreen() {
             <View style={feedStyles.cardActions}>
               <Pressable style={feedStyles.hereTooButton}>
                 <LocationPin color={COLORS.accent} size={18} />
-              </Pressable>
-              <Pressable onPress={() => deleteClip(item)} hitSlop={8} style={feedStyles.deleteButton}>
-                <Text style={feedStyles.deleteText}>Delete</Text>
               </Pressable>
             </View>
           </Pressable>
