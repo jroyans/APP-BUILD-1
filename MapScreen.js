@@ -11,6 +11,7 @@ import CircleScreen from './CircleScreen';
 
 const CLUSTER_THRESHOLD = 0.001;
 const STAMP_FONT = 'Courier New';
+const HERE_TOO_COLOR = '#F5F1E8';
 
 const ADELAIDE = {
   latitude: -34.9285,
@@ -106,6 +107,22 @@ function ClusterPin({ thumbnailUri, count }) {
   );
 }
 
+function HereTooPin({ thumbnailUri }) {
+  return (
+    <View style={pinStyles.container}>
+      <View style={hereTooStyles.box}>
+        {thumbnailUri ? (
+          <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
+        ) : (
+          <View style={hereTooStyles.placeholder} />
+        )}
+      </View>
+      <View style={hereTooStyles.stem} />
+      <View style={hereTooStyles.dot} />
+    </View>
+  );
+}
+
 // --- Settings modal ---
 
 function SettingsModal({ visible, onClose }) {
@@ -137,7 +154,7 @@ function SettingsModal({ visible, onClose }) {
 // --- Profile card ---
 
 
-function ProfileCard({ profile, momentCount, totalDuration, circleCount, onCirclePress, onSettingsPress }) {
+function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereTooCount, onCirclePress, onSettingsPress }) {
   const initials = getInitials(profile?.full_name, profile?.username);
   const displayName = profile?.full_name || profile?.username || '—';
   const location = profile?.home_location || 'Adelaide, Australia';
@@ -182,8 +199,7 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, onCircl
         <Text style={styles.statDot}> · </Text>
         <Text style={styles.stat}>{formatDuration(totalDuration)}</Text>
         <Text style={styles.statDot}> · </Text>
-        {/* TODO: connect to Here Too count in Slice 7 */}
-        <Text style={styles.stat}>0 here too</Text>
+        <Text style={styles.stat}>{hereTooCount} here too</Text>
       </View>
     </View>
   );
@@ -193,6 +209,8 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, onCircl
 
 export default function MapScreen() {
   const [clips, setClips] = useState([]);
+  const [hereTooClips, setHereTooClips] = useState([]);
+  const [hereTooCount, setHereTooCount] = useState(0);
   const [profile, setProfile] = useState(null);
   const [allClips, setAllClips] = useState([]);
   const [circleCount, setCircleCount] = useState(0);
@@ -229,14 +247,30 @@ export default function MapScreen() {
           if (userError || !user) throw userError ?? new Error('No user');
           currentUserIdRef.current = user.id;
 
-          const [profileResult, clipsResult, circleResult] = await Promise.all([
+          const [profileResult, clipsResult, circleResult, hereTooResult] = await Promise.all([
             supabase.from('profiles').select('*').eq('id', user.id).single(),
             supabase.from('clips').select('*').eq('user_id', user.id),
-            supabase.from('circles').select('id').eq('user_id', user.id),
+            supabase.from('circles').select('user_id, circle_member_id').or(`user_id.eq.${user.id},circle_member_id.eq.${user.id}`),
+            supabase.from('here_too_requests').select('clip_id').eq('requester_id', user.id).eq('status', 'approved'),
           ]);
 
           if (profileResult.data) setProfile(profileResult.data);
-          setCircleCount((circleResult.data ?? []).length);
+          setCircleCount(new Set((circleResult.data ?? []).map(r => r.user_id === user.id ? r.circle_member_id : r.user_id)).size);
+
+          const hereTooRows = hereTooResult.data ?? [];
+          setHereTooCount(hereTooRows.length);
+
+          if (hereTooRows.length > 0) {
+            const clipIds = hereTooRows.map(r => r.clip_id).filter(Boolean);
+            const { data: hereTooClipData } = await supabase
+              .from('clips')
+              .select('*')
+              .in('id', clipIds);
+            const located = (hereTooClipData ?? []).filter(c => c.latitude != null && c.longitude != null);
+            setHereTooClips(located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null })));
+          } else {
+            setHereTooClips([]);
+          }
 
           const data = clipsResult.data ?? [];
           setAllClips(data);
@@ -364,6 +398,26 @@ export default function MapScreen() {
             )}
           </Marker>
         ))}
+        {hereTooClips.map(clip => (
+          <Marker
+            key={`heretoo_${clip.id}`}
+            coordinate={{ latitude: clip.latitude, longitude: clip.longitude }}
+            anchor={{ x: 0.5, y: 1 }}
+            tracksViewChanges={clip.thumbnailUri === null}
+            onPress={async () => {
+              try {
+                const { data, error } = await supabase.storage.from('clips').createSignedUrl(clip.uri, 3600);
+                if (error) throw error;
+                setSelectedSingleClip({ ...clip, playbackUri: data.signedUrl });
+                setSelectedClips(null);
+              } catch (err) {
+                console.error('HereToo signed URL failed:', err.message);
+              }
+            }}
+          >
+            <HereTooPin thumbnailUri={clip.thumbnailUri} />
+          </Marker>
+        ))}
       </MapView>
 
       <ProfileCard
@@ -371,6 +425,7 @@ export default function MapScreen() {
         momentCount={momentCount}
         totalDuration={totalDuration}
         circleCount={circleCount}
+        hereTooCount={hereTooCount}
         onCirclePress={() => setShowCircle(true)}
         onSettingsPress={() => setShowSettings(true)}
       />
@@ -380,8 +435,10 @@ export default function MapScreen() {
         visible={showCircle}
         onClose={() => setShowCircle(false)}
         onCircleChanged={() => {
-          supabase.from('circles').select('id').eq('user_id', profile?.id).then(({ data }) => {
-            setCircleCount((data ?? []).length);
+          const uid = profile?.id;
+          if (!uid) return;
+          supabase.from('circles').select('user_id, circle_member_id').or(`user_id.eq.${uid},circle_member_id.eq.${uid}`).then(({ data }) => {
+            setCircleCount(new Set((data ?? []).map(r => r.user_id === uid ? r.circle_member_id : r.user_id)).size);
           });
         }}
       />
@@ -430,6 +487,32 @@ const pinStyles = StyleSheet.create({
     height: 6,
     borderRadius: 3,
     backgroundColor: COLORS.accent,
+  },
+});
+
+const hereTooStyles = StyleSheet.create({
+  box: {
+    width: 38,
+    height: 38,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: HERE_TOO_COLOR,
+    overflow: 'hidden',
+  },
+  placeholder: {
+    flex: 1,
+    backgroundColor: HERE_TOO_COLOR,
+  },
+  stem: {
+    width: 2,
+    height: 8,
+    backgroundColor: HERE_TOO_COLOR,
+  },
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: HERE_TOO_COLOR,
   },
 });
 

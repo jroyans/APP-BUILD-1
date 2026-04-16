@@ -1,14 +1,18 @@
 import { useCallback, useState } from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
+import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
 
-import { COLORS, LocationPin } from './constants';
+import { COLORS } from './constants';
 import VideoPlayer from './VideoPlayer';
 import { supabase } from './supabase';
 
 export default function FeedScreen() {
   const [clips, setClips] = useState([]);
   const [selectedClip, setSelectedClip] = useState(null);
+  // Map<clipId, 'pending' | 'approved'>
+  const [hereTooMap, setHereTooMap] = useState(new Map());
+  const [currentUserId, setCurrentUserId] = useState(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -21,13 +25,17 @@ export default function FeedScreen() {
       const { data: { user }, error: userError } = await supabase.auth.getUser();
       if (userError || !user) return;
 
+      setCurrentUserId(user.id);
+
       const { data: circleRows, error: circleError } = await supabase
         .from('circles')
-        .select('circle_member_id')
-        .eq('user_id', user.id);
+        .select('user_id, circle_member_id')
+        .or(`user_id.eq.${user.id},circle_member_id.eq.${user.id}`);
       if (circleError) throw circleError;
 
-      const memberIds = (circleRows ?? []).map(r => r.circle_member_id);
+      const memberIds = [...new Set(
+        (circleRows ?? []).map(r => r.user_id === user.id ? r.circle_member_id : r.user_id)
+      )];
 
       if (memberIds.length === 0) {
         setClips([]);
@@ -41,10 +49,61 @@ export default function FeedScreen() {
         .order('timestamp', { ascending: false });
       if (error) throw error;
 
-      setClips(data ?? []);
+      const loadedClips = data ?? [];
+      setClips(loadedClips);
+
+      if (loadedClips.length > 0) {
+        const clipIds = loadedClips.map(c => c.id);
+        const { data: htRows } = await supabase
+          .from('here_too_requests')
+          .select('clip_id, status')
+          .eq('requester_id', user.id)
+          .in('clip_id', clipIds);
+        const map = new Map();
+        for (const row of htRows ?? []) {
+          if (row.status !== 'declined') map.set(row.clip_id, row.status);
+        }
+        setHereTooMap(map);
+      }
     } catch (err) {
       console.error('Feed load failed:', err.message);
       setClips([]);
+    }
+  };
+
+  const handleHereToo = (clip) => {
+    const status = hereTooMap.get(clip.id);
+
+    if (status === 'approved') return; // locked — do nothing
+
+    if (!status) {
+      // Not sent yet — upsert handles both fresh insert and reviving a declined row
+      setHereTooMap(prev => new Map(prev).set(clip.id, 'pending'));
+      supabase.from('here_too_requests').upsert({
+        clip_id: clip.id,
+        requester_id: currentUserId,
+        owner_id: clip.user_id,
+        status: 'pending',
+      }, { onConflict: 'clip_id,requester_id' }).then(({ error }) => {
+        if (error) {
+          console.error('here too upsert failed:', error.message);
+          setHereTooMap(prev => { const m = new Map(prev); m.delete(clip.id); return m; });
+        }
+      });
+    } else {
+      // Pending — delete optimistically
+      setHereTooMap(prev => { const m = new Map(prev); m.delete(clip.id); return m; });
+      supabase.from('here_too_requests')
+        .delete()
+        .eq('clip_id', clip.id)
+        .eq('requester_id', currentUserId)
+        .eq('status', 'pending')
+        .then(({ error }) => {
+          if (error) {
+            console.error('here too delete failed:', error.message);
+            setHereTooMap(prev => new Map(prev).set(clip.id, 'pending'));
+          }
+        });
     }
   };
 
@@ -95,37 +154,52 @@ export default function FeedScreen() {
         data={clips}
         keyExtractor={(item) => String(item.id ?? item.timestamp)}
         contentContainerStyle={feedStyles.list}
-        renderItem={({ item, index }) => (
-          <Pressable
-            style={feedStyles.card}
-            onPress={async () => {
-              try {
-                const { data, error } = await supabase.storage.from('clips').createSignedUrl(item.uri, 3600);
-                if (error) throw error;
-                setSelectedClip({ ...item, playbackUri: data.signedUrl });
-              } catch (err) {
-                console.error('Failed to get signed URL:', err.message);
-              }
-            }}
-          >
-            <View style={feedStyles.cardMain}>
-              <View style={feedStyles.avatar}>
-                <Text style={feedStyles.avatarText}>·</Text>
+        renderItem={({ item }) => {
+          const htStatus = hereTooMap.get(item.id);
+          const isPending = htStatus === 'pending';
+          const isApproved = htStatus === 'approved';
+          return (
+            <Pressable
+              style={feedStyles.card}
+              onPress={async () => {
+                try {
+                  const { data, error } = await supabase.storage.from('clips').createSignedUrl(item.uri, 3600);
+                  if (error) throw error;
+                  setSelectedClip({ ...item, playbackUri: data.signedUrl });
+                } catch (err) {
+                  console.error('Failed to get signed URL:', err.message);
+                }
+              }}
+            >
+              <View style={feedStyles.cardMain}>
+                <View style={feedStyles.avatar}>
+                  <Text style={feedStyles.avatarText}>·</Text>
+                </View>
+                <View style={feedStyles.cardInfo}>
+                  <Text style={feedStyles.cardDate}>{formatDate(item.timestamp)}</Text>
+                  {item.duration != null && (
+                    <Text style={feedStyles.duration}>{formatDuration(item.duration)}</Text>
+                  )}
+                </View>
               </View>
-              <View style={feedStyles.cardInfo}>
-                <Text style={feedStyles.cardDate}>{formatDate(item.timestamp)}</Text>
-                {item.duration != null && (
-                  <Text style={feedStyles.duration}>{formatDuration(item.duration)}</Text>
-                )}
+              <View style={feedStyles.cardActions}>
+                <Pressable
+                  style={[feedStyles.hereTooButton, (isPending || isApproved) && feedStyles.hereTooButtonSent]}
+                  onPress={(e) => { e.stopPropagation(); handleHereToo(item); }}
+                  hitSlop={8}
+                >
+                  {isApproved ? (
+                    <MaterialCommunityIcons name="map-marker" size={20} color="#FFFFFF" />
+                  ) : isPending ? (
+                    <MaterialCommunityIcons name="check" size={20} color="#FFFFFF" />
+                  ) : (
+                    <MaterialCommunityIcons name="account-group" size={20} color={COLORS.accent} />
+                  )}
+                </Pressable>
               </View>
-            </View>
-            <View style={feedStyles.cardActions}>
-              <Pressable style={feedStyles.hereTooButton}>
-                <LocationPin color={COLORS.accent} size={18} />
-              </Pressable>
-            </View>
-          </Pressable>
-        )}
+            </Pressable>
+          );
+        }}
       />
     </View>
   );
@@ -175,11 +249,6 @@ const feedStyles = StyleSheet.create({
     flex: 1,
     gap: 2,
   },
-  username: {
-    color: COLORS.text,
-    fontSize: 15,
-    fontWeight: '500',
-  },
   cardDate: {
     color: COLORS.secondary,
     fontSize: 12,
@@ -200,19 +269,13 @@ const feedStyles = StyleSheet.create({
     borderRadius: 21,
     borderWidth: 1.5,
     borderColor: COLORS.accent,
-    backgroundColor: 'rgba(200,106,74,0.12)',
+    backgroundColor: 'transparent',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  deleteButton: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-  },
-  deleteText: {
-    color: COLORS.text,
-    fontSize: 11,
-    letterSpacing: 0.5,
-    opacity: 0.4,
+  hereTooButtonSent: {
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.accent,
   },
   emptyText: {
     color: COLORS.text,
