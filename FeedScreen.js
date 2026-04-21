@@ -1,18 +1,119 @@
-import { useCallback, useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { FlatList, Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
+import { useVideoPlayer, VideoView } from 'expo-video';
 import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
 
 import { COLORS } from './constants';
-import VideoPlayer from './VideoPlayer';
 import { supabase } from './supabase';
 
+const FONT = 'Courier New';
+
+function getInitials(str) {
+  if (!str) return '??';
+  return str.slice(0, 2).toUpperCase();
+}
+
+// ─── Per-clip item ────────────────────────────────────────────────────────────
+
+function ClipItem({ item, isVisible, htStatus, onHereToo, profile, height }) {
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  const player = useVideoPlayer(item.signedUrl ?? null, (p) => {
+    p.loop = true;
+  });
+
+  useEffect(() => {
+    if (!item.signedUrl) return;
+    if (isVisible) {
+      player.currentTime = 0;
+      player.play();
+      setIsPlaying(true);
+    } else {
+      player.pause();
+      setIsPlaying(false);
+    }
+  }, [isVisible, item.signedUrl]);
+
+  const togglePlay = () => {
+    if (isPlaying) {
+      player.pause();
+      setIsPlaying(false);
+    } else {
+      player.play();
+      setIsPlaying(true);
+    }
+  };
+
+  const isPending = htStatus === 'pending';
+  const isApproved = htStatus === 'approved';
+
+  const username = profile?.username ?? null;
+  const initials = username ? getInitials(username) : getInitials(item.user_id);
+  const displayName = username ?? item.user_id?.slice(0, 8) ?? '—';
+
+  return (
+    <Pressable style={[styles.clip, { height }]} onPress={togglePlay}>
+      {item.signedUrl ? (
+        <VideoView
+          player={player}
+          style={StyleSheet.absoluteFillObject}
+          contentFit="cover"
+          nativeControls={false}
+        />
+      ) : (
+        <View style={[StyleSheet.absoluteFillObject, styles.loadingBg]} />
+      )}
+
+      {/* Pause indicator */}
+      {!isPlaying && (
+        <View style={styles.pauseOverlay} pointerEvents="none">
+          <View style={styles.pauseCircle}>
+            <View style={styles.pauseBar} />
+            <View style={styles.pauseBar} />
+          </View>
+        </View>
+      )}
+
+      {/* Bottom-left: avatar + name */}
+      <View style={styles.overlayBottomLeft} pointerEvents="none">
+        <View style={styles.avatarCircle}>
+          <Text style={styles.avatarInitials}>{initials}</Text>
+        </View>
+        <Text style={styles.overlayUsername}>{displayName}</Text>
+      </View>
+
+      {/* Bottom-right: Here Too button */}
+      <View style={styles.overlayBottomRight}>
+        <Pressable
+          style={[styles.hereTooButton, (isPending || isApproved) && styles.hereTooButtonSent]}
+          onPress={() => onHereToo(item)}
+          hitSlop={8}
+        >
+          {isApproved ? (
+            <MaterialCommunityIcons name="map-marker" size={20} color="#FFFFFF" />
+          ) : isPending ? (
+            <MaterialCommunityIcons name="check" size={20} color="#FFFFFF" />
+          ) : (
+            <MaterialCommunityIcons name="account-group" size={20} color={COLORS.accent} />
+          )}
+        </Pressable>
+      </View>
+    </Pressable>
+  );
+}
+
+// ─── Feed ─────────────────────────────────────────────────────────────────────
+
 export default function FeedScreen() {
+  const { height: windowHeight } = useWindowDimensions();
+  const [containerHeight, setContainerHeight] = useState(windowHeight);
+
   const [clips, setClips] = useState([]);
-  const [selectedClip, setSelectedClip] = useState(null);
-  // Map<clipId, 'pending' | 'approved'>
   const [hereTooMap, setHereTooMap] = useState(new Map());
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [visibleIndex, setVisibleIndex] = useState(0);
+  const [profiles, setProfiles] = useState({});
 
   useFocusEffect(
     useCallback(() => {
@@ -50,8 +151,32 @@ export default function FeedScreen() {
       if (error) throw error;
 
       const loadedClips = data ?? [];
-      setClips(loadedClips);
 
+      // Fetch signed URLs for all clips upfront
+      const signedUrls = await Promise.all(
+        loadedClips.map(clip =>
+          supabase.storage.from('clips').createSignedUrl(clip.uri, 3600)
+            .then(({ data: d }) => d?.signedUrl ?? null)
+            .catch(() => null)
+        )
+      );
+      const clipsWithUrls = loadedClips.map((clip, i) => ({ ...clip, signedUrl: signedUrls[i] }));
+      setClips(clipsWithUrls);
+
+      // Try to load usernames from profiles (graceful fallback if table absent)
+      try {
+        const { data: profileRows } = await supabase
+          .from('profiles')
+          .select('id, username')
+          .in('id', memberIds);
+        if (profileRows) {
+          const map = {};
+          for (const p of profileRows) map[p.id] = p;
+          setProfiles(map);
+        }
+      } catch (_) {}
+
+      // Load Here Too state
       if (loadedClips.length > 0) {
         const clipIds = loadedClips.map(c => c.id);
         const { data: htRows } = await supabase
@@ -74,10 +199,9 @@ export default function FeedScreen() {
   const handleHereToo = (clip) => {
     const status = hereTooMap.get(clip.id);
 
-    if (status === 'approved') return; // locked — do nothing
+    if (status === 'approved') return;
 
     if (!status) {
-      // Not sent yet — upsert handles both fresh insert and reviving a declined row
       setHereTooMap(prev => new Map(prev).set(clip.id, 'pending'));
       supabase.from('here_too_requests').upsert({
         clip_id: clip.id,
@@ -91,7 +215,6 @@ export default function FeedScreen() {
         }
       });
     } else {
-      // Pending — delete optimistically
       setHereTooMap(prev => { const m = new Map(prev); m.delete(clip.id); return m; });
       supabase.from('here_too_requests')
         .delete()
@@ -107,105 +230,55 @@ export default function FeedScreen() {
     }
   };
 
-  const formatDate = (timestamp) => {
-    const date = new Date(timestamp);
-    const now = new Date();
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 60 }).current;
 
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const startOfYesterday = new Date(startOfToday - 24 * 60 * 60 * 1000);
-    const startOfWeek = new Date(startOfToday - 6 * 24 * 60 * 60 * 1000);
-
-    const time = date.toLocaleString('en-AU', { hour: 'numeric', minute: '2-digit', hour12: true })
-      .toLowerCase().replace('\u202f', '');
-
-    if (date >= startOfToday) {
-      return `Today · ${time}`;
-    } else if (date >= startOfYesterday) {
-      return `Yesterday · ${time}`;
-    } else if (date >= startOfWeek) {
-      const day = date.toLocaleString('en-AU', { weekday: 'long' });
-      return `${day} · ${time}`;
-    } else {
-      const label = date.toLocaleString('en-AU', { day: 'numeric', month: 'short' });
-      return `${label} · ${time}`;
+  const onViewableItemsChanged = useCallback(({ viewableItems }) => {
+    if (viewableItems.length > 0) {
+      setVisibleIndex(viewableItems[0].index);
     }
-  };
-
-  const formatDuration = (duration) => {
-    if (duration == null) return null;
-    if (duration < 60) return `${duration}s`;
-    return `${Math.floor(duration / 60)}m ${duration % 60}s`;
-  };
+  }, []);
 
   if (clips.length === 0) {
     return (
-      <View style={[feedStyles.container, feedStyles.centered]}>
-        <Text style={feedStyles.emptyText}>add someone to your circle to see their moments</Text>
+      <View style={[styles.container, styles.centered]}>
+        <Text style={styles.emptyText}>add someone to your circle to see their moments</Text>
       </View>
     );
   }
 
   return (
-    <View style={feedStyles.container}>
-      {selectedClip && (
-        <VideoPlayer clip={selectedClip} onClose={() => setSelectedClip(null)} />
-      )}
+    <View
+      style={styles.container}
+      onLayout={(e) => setContainerHeight(e.nativeEvent.layout.height)}
+    >
       <FlatList
         data={clips}
         keyExtractor={(item) => String(item.id ?? item.timestamp)}
-        contentContainerStyle={feedStyles.list}
-        renderItem={({ item }) => {
-          const htStatus = hereTooMap.get(item.id);
-          const isPending = htStatus === 'pending';
-          const isApproved = htStatus === 'approved';
-          return (
-            <Pressable
-              style={feedStyles.card}
-              onPress={async () => {
-                try {
-                  const { data, error } = await supabase.storage.from('clips').createSignedUrl(item.uri, 3600);
-                  if (error) throw error;
-                  setSelectedClip({ ...item, playbackUri: data.signedUrl });
-                } catch (err) {
-                  console.error('Failed to get signed URL:', err.message);
-                }
-              }}
-            >
-              <View style={feedStyles.cardMain}>
-                <View style={feedStyles.avatar}>
-                  <Text style={feedStyles.avatarText}>·</Text>
-                </View>
-                <View style={feedStyles.cardInfo}>
-                  <Text style={feedStyles.cardDate}>{formatDate(item.timestamp)}</Text>
-                  {item.duration != null && (
-                    <Text style={feedStyles.duration}>{formatDuration(item.duration)}</Text>
-                  )}
-                </View>
-              </View>
-              <View style={feedStyles.cardActions}>
-                <Pressable
-                  style={[feedStyles.hereTooButton, (isPending || isApproved) && feedStyles.hereTooButtonSent]}
-                  onPress={(e) => { e.stopPropagation(); handleHereToo(item); }}
-                  hitSlop={8}
-                >
-                  {isApproved ? (
-                    <MaterialCommunityIcons name="map-marker" size={20} color="#FFFFFF" />
-                  ) : isPending ? (
-                    <MaterialCommunityIcons name="check" size={20} color="#FFFFFF" />
-                  ) : (
-                    <MaterialCommunityIcons name="account-group" size={20} color={COLORS.accent} />
-                  )}
-                </Pressable>
-              </View>
-            </Pressable>
-          );
-        }}
+        pagingEnabled
+        showsVerticalScrollIndicator={false}
+        viewabilityConfig={viewabilityConfig}
+        onViewableItemsChanged={onViewableItemsChanged}
+        getItemLayout={(_, index) => ({
+          length: containerHeight,
+          offset: containerHeight * index,
+          index,
+        })}
+        renderItem={({ item, index }) => (
+          <ClipItem
+            item={item}
+            isVisible={index === visibleIndex}
+            htStatus={hereTooMap.get(item.id)}
+            onHereToo={handleHereToo}
+            profile={profiles[item.user_id]}
+            height={containerHeight}
+          />
+        )}
       />
     </View>
   );
 }
 
-const feedStyles = StyleSheet.create({
+const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: COLORS.background,
@@ -214,72 +287,88 @@ const feedStyles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  list: {
-    padding: 16,
-    gap: 12,
+  emptyText: {
+    color: COLORS.text,
+    fontFamily: FONT,
+    fontSize: 14,
+    opacity: 0.5,
+    textAlign: 'center',
+    paddingHorizontal: 32,
   },
-  card: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 4,
-    padding: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+  clip: {
+    backgroundColor: '#000',
+    overflow: 'hidden',
   },
-  cardMain: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-    gap: 12,
+  loadingBg: {
+    backgroundColor: COLORS.background,
   },
-  avatar: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: COLORS.secondary,
+  pauseOverlay: {
+    ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  avatarText: {
-    color: COLORS.text,
-    fontSize: 12,
-    fontWeight: '500',
+  pauseCircle: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: 'rgba(31,31,31,0.55)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  cardInfo: {
-    flex: 1,
-    gap: 2,
+  pauseBar: {
+    width: 4,
+    height: 18,
+    borderRadius: 2,
+    backgroundColor: '#fff',
+    marginHorizontal: 3.5,
   },
-  cardDate: {
-    color: COLORS.secondary,
-    fontSize: 12,
-    marginTop: 2,
-  },
-  duration: {
-    color: COLORS.secondary,
-    fontSize: 12,
-  },
-  cardActions: {
+  overlayBottomLeft: {
+    position: 'absolute',
+    bottom: 90,
+    left: 20,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
   },
+  avatarCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: COLORS.secondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarInitials: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  overlayUsername: {
+    color: COLORS.text,
+    fontSize: 17,
+    fontWeight: '500',
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  overlayBottomRight: {
+    position: 'absolute',
+    bottom: 90,
+    right: 20,
+  },
   hereTooButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     borderWidth: 1.5,
     borderColor: COLORS.accent,
-    backgroundColor: 'transparent',
+    backgroundColor: 'rgba(31,31,31,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   hereTooButtonSent: {
     backgroundColor: COLORS.accent,
     borderColor: COLORS.accent,
-  },
-  emptyText: {
-    color: COLORS.text,
-    fontSize: 16,
-    opacity: 0.5,
   },
 });
