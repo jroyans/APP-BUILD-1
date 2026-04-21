@@ -16,7 +16,7 @@ function getInitials(str) {
 
 // ─── Per-clip item ────────────────────────────────────────────────────────────
 
-function ClipItem({ item, isVisible, htStatus, onHereToo, profile, height }) {
+function ClipItem({ item, isVisible, htStatus, onHereToo, profile, height, onPlayerReady }) {
   const [isPlaying, setIsPlaying] = useState(false);
 
   const player = useVideoPlayer(item.signedUrl ?? null, (p) => {
@@ -26,6 +26,7 @@ function ClipItem({ item, isVisible, htStatus, onHereToo, profile, height }) {
   useEffect(() => {
     if (!item.signedUrl) return;
     if (isVisible) {
+      onPlayerReady?.(player);
       player.currentTime = 0;
       player.play();
       setIsPlaying(true);
@@ -114,10 +115,14 @@ export default function FeedScreen() {
   const [currentUserId, setCurrentUserId] = useState(null);
   const [visibleIndex, setVisibleIndex] = useState(0);
   const [profiles, setProfiles] = useState({});
+  const activePlayerRef = useRef(null);
 
   useFocusEffect(
     useCallback(() => {
       loadClips();
+      return () => {
+        activePlayerRef.current?.pause();
+      };
     }, [])
   );
 
@@ -271,6 +276,7 @@ export default function FeedScreen() {
             onHereToo={handleHereToo}
             profile={profiles[item.user_id]}
             height={containerHeight}
+            onPlayerReady={(p) => { activePlayerRef.current = p; }}
           />
         )}
       />

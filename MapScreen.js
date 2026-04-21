@@ -1,17 +1,18 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
-import { Alert, Image, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Animated, Image, Modal, Pressable,
+  ScrollView, StyleSheet, Text, useWindowDimensions, View,
+} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import MapView, { Marker } from 'react-native-maps';
 import * as VideoThumbnails from 'expo-video-thumbnails';
-import { COLORS } from './constants';
+import { COLORS, RecordingContext } from './constants';
 import { supabase } from './supabase';
 import VideoPlayer from './VideoPlayer';
 import CircleScreen from './CircleScreen';
 
-const CLUSTER_THRESHOLD = 0.001;
 const STAMP_FONT = 'Courier New';
-const HERE_TOO_COLOR = '#F5F1E8';
 
 const ADELAIDE = {
   latitude: -34.9285,
@@ -20,7 +21,10 @@ const ADELAIDE = {
   longitudeDelta: 0.05,
 };
 
-// --- Helpers ---
+// Zoom level at which pins switch between dot and polaroid
+const DOT_MODE_THRESHOLD = 11;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getInitials(fullName, username) {
   if (fullName && fullName.trim()) {
@@ -39,9 +43,67 @@ function formatDuration(totalSeconds) {
   return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
-// --- Clustering ---
+function formatPinDate(timestamp) {
+  const d = new Date(timestamp);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yy = String(d.getFullYear()).slice(2);
+  return `${dd}.${mm}.${yy}`;
+}
 
-function buildClusters(clips) {
+// ─── Clustering ───────────────────────────────────────────────────────────────
+
+// Zoom-aware cluster threshold in degrees.
+// Aggressive at city zoom, 50m floor at high zoom to absorb GPS drift.
+// Lat/lng delta from a zoom level integer
+function deltaForZoom(zoom) {
+  return 360 / Math.pow(2, zoom + 1);
+}
+
+// Minimum zoom level needed to make a dot's cluster actionable:
+// - Must cross DOT_MODE_THRESHOLD so polaroids render
+// - If multi-clip, must be high enough that the cluster either separates
+//   OR is within the permanent 50m threshold (stays as one, but is now a
+//   tappable cluster polaroid showing the strip)
+function zoomToResolveCluster(cluster) {
+  const minPolaroidZoom = DOT_MODE_THRESHOLD + 1; // first zoom where polaroids show
+  if (cluster.clips.length === 1) return minPolaroidZoom;
+
+  // Max Chebyshev distance between any pair of clips
+  const clips = cluster.clips;
+  let maxDist = 0;
+  for (let i = 0; i < clips.length; i++) {
+    for (let j = i + 1; j < clips.length; j++) {
+      const d = Math.max(
+        Math.abs(clips[i].latitude - clips[j].latitude),
+        Math.abs(clips[i].longitude - clips[j].longitude)
+      );
+      if (d > maxDist) maxDist = d;
+    }
+  }
+
+  // Find the first integer zoom where the cluster threshold drops below maxDist,
+  // meaning clips would start to separate. If maxDist is within the permanent
+  // floor, they'll always cluster together — just show as polaroid cluster at
+  // minPolaroidZoom.
+  for (let z = minPolaroidZoom; z <= 20; z++) {
+    if (clusterThresholdForZoom(z) < maxDist) return z;
+  }
+  return minPolaroidZoom;
+}
+
+function clusterThresholdForZoom(zoom) {
+  const HIGH_ZOOM_FLOOR = 0.00045; // ~50m, handles GPS inaccuracy
+  if (zoom <= DOT_MODE_THRESHOLD) return 0.01;   // ~1km at city view
+  if (zoom >= 16) return HIGH_ZOOM_FLOOR;
+  const t = (zoom - DOT_MODE_THRESHOLD) / (16 - DOT_MODE_THRESHOLD);
+  return 0.01 * (1 - t) + HIGH_ZOOM_FLOOR * t;
+}
+
+// Own + HereToo clips merged into unified clusters.
+// Each clip must have { latitude, longitude, timestamp, hereToo? }
+function buildClusters(clips, zoom) {
+  const threshold = clusterThresholdForZoom(zoom);
   const used = new Set();
   const clusters = [];
   for (let i = 0; i < clips.length; i++) {
@@ -51,18 +113,19 @@ function buildClusters(clips) {
     for (let j = i + 1; j < clips.length; j++) {
       if (used.has(j)) continue;
       if (
-        Math.abs(clips[i].latitude - clips[j].latitude) <= CLUSTER_THRESHOLD &&
-        Math.abs(clips[i].longitude - clips[j].longitude) <= CLUSTER_THRESHOLD
+        Math.abs(clips[i].latitude - clips[j].latitude) <= threshold &&
+        Math.abs(clips[i].longitude - clips[j].longitude) <= threshold
       ) {
         group.push(clips[j]);
         used.add(j);
       }
     }
-    group.sort((a, b) => a.timestamp - b.timestamp);
+    // Most recent first — front thumbnail + date from clips[0]
+    group.sort((a, b) => b.timestamp - a.timestamp);
     const lat = group.reduce((s, c) => s + c.latitude, 0) / group.length;
     const lng = group.reduce((s, c) => s + c.longitude, 0) / group.length;
     clusters.push({
-      id: `cluster_${clips[i].id}`,
+      id: `cluster_${clips[i].id ?? clips[i].localId}`,
       clips: group,
       centroid: { latitude: lat, longitude: lng },
     });
@@ -70,35 +133,52 @@ function buildClusters(clips) {
   return clusters;
 }
 
-// --- Pin components ---
+// Pin size: 64px at Z14, scales with zoom, capped 44–100px
+function pinSize(zoom) {
+  return Math.min(100, Math.max(44, Math.round(64 * (1 + (zoom - 14) * 0.12))));
+}
 
-function Pin({ thumbnailUri }) {
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+// Simple dot shown below DOT_MODE_THRESHOLD
+function DotPin({ hereToo }) {
   return (
-    <View style={pinStyles.container}>
-      <View style={pinStyles.box}>
-        {thumbnailUri ? (
-          <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
-        ) : (
-          <View style={pinStyles.placeholder} />
-        )}
-      </View>
-      <View style={pinStyles.stem} />
-      <View style={pinStyles.dot} />
-    </View>
+    <View style={[dotPinStyles.dot, {
+      backgroundColor: hereToo ? '#F5F1E8' : COLORS.accent,
+    }]} />
   );
 }
 
-function ClusterPin({ thumbnailUri, count }) {
+function PolaroidPin({ thumbnailUri, timestamp, hereToo = false, ownerProfile = null, size = 64 }) {
+  const frameColor = hereToo ? '#F5F1E8' : COLORS.accent;
+  const stripColor = hereToo ? '#FFFFFF' : COLORS.accent;
+  const dateColor = hereToo ? COLORS.secondary : '#F5F1E8';
+  const imgH = Math.round(size * 0.68);
+  const stripH = Math.round(size * 0.24);
+  const pad = Math.round(size * 0.07);
+  const fontSize = Math.max(7, Math.round(size * 0.14));
+  const avatarSize = Math.round(size * 0.28);
   return (
     <View style={pinStyles.container}>
-      <View style={clusterPinStyles.box}>
-        {thumbnailUri ? (
-          <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
-        ) : (
-          <View style={pinStyles.placeholder} />
+      <View style={[pinStyles.frame, { width: size, backgroundColor: frameColor }]}>
+        <View style={[pinStyles.imageWrapper, { margin: pad, marginBottom: 0, height: imgH }]}>
+          {thumbnailUri ? (
+            <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
+          ) : (
+            <View style={pinStyles.placeholder} />
+          )}
+        </View>
+        {hereToo && ownerProfile && (
+          <View style={[pinStyles.cornerBadge, { top: pad, left: pad, width: avatarSize, height: avatarSize, borderRadius: avatarSize / 2 }]}>
+            <Text style={[pinStyles.cornerBadgeText, { fontSize: Math.max(6, Math.round(avatarSize * 0.42)) }]}>
+              {getInitials(ownerProfile.full_name, ownerProfile.username)}
+            </Text>
+          </View>
         )}
-        <View style={clusterPinStyles.badge}>
-          <Text style={clusterPinStyles.badgeText}>{count}</Text>
+        <View style={[pinStyles.strip, { height: stripH, backgroundColor: stripColor }]}>
+          <Text style={[pinStyles.dateText, { color: dateColor, fontSize }]}>
+            {formatPinDate(timestamp)}
+          </Text>
         </View>
       </View>
       <View style={pinStyles.stem} />
@@ -107,23 +187,138 @@ function ClusterPin({ thumbnailUri, count }) {
   );
 }
 
-function HereTooPin({ thumbnailUri }) {
+const CLUSTER_STEP_X = 5;
+const CLUSTER_STEP_Y = 4;
+
+function ClusterPin({ thumbnailUri, timestamp, count, frontHereToo = false, size = 64 }) {
+  const frameColor = frontHereToo ? '#F5F1E8' : COLORS.accent;
+  const stripColor = frontHereToo ? '#FFFFFF' : COLORS.accent;
+  const dateColor = frontHereToo ? COLORS.secondary : '#F5F1E8';
+  const stackW = size + CLUSTER_STEP_X * 2;
+  const stemOffset = stackW - size / 2;
+  const imgH = Math.round(size * 0.68);
+  const stripH = Math.round(size * 0.24);
+  const pad = Math.round(size * 0.07);
+  const fontSize = Math.max(7, Math.round(size * 0.14));
+  const frameH = imgH + stripH + pad;
   return (
-    <View style={pinStyles.container}>
-      <View style={hereTooStyles.box}>
-        {thumbnailUri ? (
-          <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
-        ) : (
-          <View style={hereTooStyles.placeholder} />
-        )}
+    <View style={clusterPinStyles.outerContainer}>
+      <View style={{ width: stackW, height: frameH + CLUSTER_STEP_Y * 2 }}>
+        {/* Back frames — same color as front, separated by 1px dark border */}
+        <View style={[clusterPinStyles.frame, {
+          width: size, height: frameH, backgroundColor: frameColor,
+          right: CLUSTER_STEP_X * 2, bottom: CLUSTER_STEP_Y * 2,
+        }]} />
+        <View style={[clusterPinStyles.frame, {
+          width: size, height: frameH, backgroundColor: frameColor,
+          right: CLUSTER_STEP_X, bottom: CLUSTER_STEP_Y,
+        }]} />
+        {/* Front frame */}
+        <View style={[clusterPinStyles.frame, {
+          width: size, height: frameH, backgroundColor: frameColor,
+          right: 0, bottom: 0,
+        }]}>
+          <View style={[pinStyles.imageWrapper, { margin: pad, marginBottom: 0, height: imgH }]}>
+            {thumbnailUri ? (
+              <Image source={{ uri: thumbnailUri }} style={pinStyles.image} resizeMode="cover" />
+            ) : (
+              <View style={pinStyles.placeholder} />
+            )}
+          </View>
+          <View style={[clusterPinStyles.strip, { height: stripH, backgroundColor: stripColor }]}>
+            <Text style={[pinStyles.dateText, { color: dateColor, fontSize }]}>
+              {formatPinDate(timestamp)}
+            </Text>
+          </View>
+          {/* Count badge top-left */}
+          <View style={clusterPinStyles.badge}>
+            <Text style={clusterPinStyles.badgeText}>{count}</Text>
+          </View>
+        </View>
       </View>
-      <View style={hereTooStyles.stem} />
-      <View style={hereTooStyles.dot} />
+      <View style={{ width: stackW }}>
+        <View style={[pinStyles.stem, { marginLeft: stemOffset - 1 }]} />
+        <View style={[pinStyles.dot, { marginLeft: stemOffset - 3 }]} />
+      </View>
     </View>
   );
 }
 
-// --- Settings modal ---
+// ─── Cluster strip ─────────────────────────────────────────────────────────────
+
+function ClusterStrip({ cluster, ownerProfiles, onClose, onSelectClip }) {
+  const { width: screenW } = useWindowDimensions();
+  const slideAnim = useRef(new Animated.Value(300)).current;
+
+  useEffect(() => {
+    Animated.spring(slideAnim, { toValue: 0, useNativeDriver: true, bounciness: 4, speed: 14 }).start();
+  }, []);
+
+  const dismiss = () => {
+    Animated.timing(slideAnim, { toValue: 300, duration: 250, useNativeDriver: true }).start(onClose);
+  };
+
+  const THUMB_W = Math.round(screenW / 4.5);
+  const THUMB_H = Math.round(THUMB_W * 1.25);
+  const PAD = Math.round(THUMB_W * 0.07);
+  const DATE_H = Math.round(THUMB_H * 0.22);
+  const IMG_H = THUMB_H - DATE_H - PAD;
+  const AVATAR_SIZE = Math.round(THUMB_W * 0.26);
+  const DATE_FONT = Math.max(8, Math.round(THUMB_W * 0.15));
+
+  return (
+    <Animated.View style={[stripStyles.container, { transform: [{ translateY: slideAnim }] }]}>
+      <View style={stripStyles.handleRow}>
+        <View style={stripStyles.handle} />
+        <Pressable style={stripStyles.closeBtn} onPress={dismiss} hitSlop={12}>
+          <Ionicons name="close" size={18} color={COLORS.text} />
+        </Pressable>
+      </View>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={stripStyles.scrollContent}
+      >
+        {cluster.clips.map((clip) => {
+          const isHereToo = clip.hereToo ?? false;
+          const frameColor = isHereToo ? '#F5F1E8' : COLORS.accent;
+          const dateColor = isHereToo ? COLORS.secondary : '#F5F1E8';
+          const ownerProfile = isHereToo ? ownerProfiles[clip.user_id] : null;
+          return (
+            <Pressable key={clip.id ?? clip.localId} onPress={() => onSelectClip(clip)} style={{ marginRight: 10 }}>
+              <View style={[stripStyles.thumbFrame, { width: THUMB_W, backgroundColor: frameColor }]}>
+                <View style={{ margin: PAD, marginBottom: 0, height: IMG_H, overflow: 'hidden', borderRadius: 2 }}>
+                  {clip.thumbnailUri ? (
+                    <Image source={{ uri: clip.thumbnailUri }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+                  ) : (
+                    <View style={{ flex: 1, backgroundColor: COLORS.secondary, opacity: 0.4 }} />
+                  )}
+                </View>
+                {isHereToo && ownerProfile && (
+                  <View style={[stripStyles.thumbAvatar, {
+                    width: AVATAR_SIZE, height: AVATAR_SIZE, borderRadius: AVATAR_SIZE / 2,
+                    top: PAD, left: PAD,
+                  }]}>
+                    <Text style={[stripStyles.thumbAvatarText, { fontSize: Math.max(6, Math.round(AVATAR_SIZE * 0.42)) }]}>
+                      {getInitials(ownerProfile.full_name, ownerProfile.username)}
+                    </Text>
+                  </View>
+                )}
+                <View style={{ height: DATE_H, alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={[stripStyles.thumbDate, { fontSize: DATE_FONT, color: dateColor }]}>
+                    {formatPinDate(clip.timestamp)}
+                  </Text>
+                </View>
+              </View>
+            </Pressable>
+          );
+        })}
+      </ScrollView>
+    </Animated.View>
+  );
+}
+
+// ─── Settings modal ────────────────────────────────────────────────────────────
 
 function SettingsModal({ visible, onClose }) {
   const handleSignOut = async () => {
@@ -151,19 +346,15 @@ function SettingsModal({ visible, onClose }) {
   );
 }
 
-// --- Profile card ---
-
+// ─── Profile card ──────────────────────────────────────────────────────────────
 
 function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereTooCount, onCirclePress, onSettingsPress }) {
   const initials = getInitials(profile?.full_name, profile?.username);
   const displayName = profile?.full_name || profile?.username || '—';
   const location = profile?.home_location || 'Adelaide, Australia';
-
   return (
     <View style={styles.profileCard}>
-      {/* Avatar row */}
       <View style={styles.avatarRow}>
-        {/* Avatar with circle badge */}
         <View style={{ width: 42, height: 42, marginRight: 13 }}>
           <View style={styles.avatar}>
             <Text style={styles.avatarInitials}>{initials}</Text>
@@ -172,14 +363,10 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
             <Text style={styles.circleBadgeText}>{circleCount}</Text>
           </View>
         </View>
-
-        {/* Name and location */}
         <View style={{ flex: 1 }}>
           <Text style={styles.name} numberOfLines={1}>{displayName}</Text>
           <Text style={styles.location} numberOfLines={1}>{location}</Text>
         </View>
-
-        {/* Icon buttons */}
         <View style={styles.iconRow}>
           <Pressable style={styles.iconButtonSecondary} onPress={onCirclePress}>
             <Ionicons name="people" size={20} color="#fff" />
@@ -189,11 +376,7 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
           </Pressable>
         </View>
       </View>
-
-      {/* Divider */}
       <View style={styles.divider} />
-
-      {/* Stats row */}
       <View style={styles.statsRow}>
         <Text style={styles.stat}>{momentCount} moments</Text>
         <Text style={styles.statDot}> · </Text>
@@ -205,7 +388,7 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
   );
 }
 
-// --- Main screen ---
+// ─── Main screen ───────────────────────────────────────────────────────────────
 
 export default function MapScreen() {
   const [clips, setClips] = useState([]);
@@ -214,11 +397,61 @@ export default function MapScreen() {
   const [profile, setProfile] = useState(null);
   const [allClips, setAllClips] = useState([]);
   const [circleCount, setCircleCount] = useState(0);
+  const [ownerProfiles, setOwnerProfiles] = useState({});
   const [showCircle, setShowCircle] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [selectedSingleClip, setSelectedSingleClip] = useState(null);
-  const [selectedClips, setSelectedClips] = useState(null);
+  const [zoomLevel, setZoomLevel] = useState(14);
+  const [activeCluster, setActiveCluster] = useState(null);
+  const [selectedClip, setSelectedClip] = useState(null);
   const currentUserIdRef = useRef(null);
+  const mapRef = useRef(null);
+
+  const { pendingClips, removePendingClip, setIsStripOpen } = useContext(RecordingContext);
+
+  const isDotMode = zoomLevel < DOT_MODE_THRESHOLD;
+
+  const supabaseTimestamps = useMemo(() => new Set(clips.map(c => c.timestamp)), [clips]);
+  const mergedOwnClips = useMemo(() => {
+    const fresh = pendingClips.filter(
+      p => p.latitude != null && p.longitude != null && !supabaseTimestamps.has(p.timestamp)
+    );
+    return [...clips, ...fresh];
+  }, [clips, pendingClips, supabaseTimestamps]);
+
+  // Unified clip pool: own clips + hereToo clips tagged with hereToo:true
+  const allClipsForMap = useMemo(() => [
+    ...mergedOwnClips,
+    ...hereTooClips.map(c => ({ ...c, hereToo: true })),
+  ], [mergedOwnClips, hereTooClips]);
+
+  const clusters = useMemo(() => buildClusters(allClipsForMap, zoomLevel), [allClipsForMap, zoomLevel]);
+  const size = pinSize(zoomLevel);
+
+  const momentCount = allClips.length;
+  const totalDuration = allClips.reduce((sum, c) => sum + (c.duration ?? 0), 0);
+
+  const fitToAllClips = useCallback((ownLocated, hereTooLocated) => {
+    const coords = [
+      ...ownLocated.map(c => ({ latitude: c.latitude, longitude: c.longitude })),
+      ...hereTooLocated.map(c => ({ latitude: c.latitude, longitude: c.longitude })),
+    ].filter(c => c.latitude != null && c.longitude != null);
+    if (coords.length === 0) return;
+    setTimeout(() => {
+      if (!mapRef.current) return;
+      if (coords.length === 1) {
+        mapRef.current.animateToRegion({
+          ...coords[0],
+          latitudeDelta: 0.005,
+          longitudeDelta: 0.005,
+        }, 600);
+      } else {
+        mapRef.current.fitToCoordinates(coords, {
+          edgePadding: { top: 160, right: 60, bottom: 120, left: 60 },
+          animated: true,
+        });
+      }
+    }, 250);
+  }, []);
 
   const refreshClips = useCallback(async () => {
     if (!currentUserIdRef.current) return;
@@ -227,17 +460,11 @@ export default function MapScreen() {
       const all = data ?? [];
       setAllClips(all);
       const located = all.filter(c => c.latitude != null && c.longitude != null);
-      const withThumb = located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null }));
-      setClips(withThumb);
+      setClips(located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null })));
     } catch (err) {
       console.error('Clips refresh failed:', err.message);
     }
   }, []);
-
-  const clusters = useMemo(() => buildClusters(clips), [clips]);
-
-  const momentCount = allClips.length;
-  const totalDuration = allClips.reduce((sum, c) => sum + (c.duration ?? 0), 0);
 
   useFocusEffect(
     useCallback(() => {
@@ -260,36 +487,47 @@ export default function MapScreen() {
           const hereTooRows = hereTooResult.data ?? [];
           setHereTooCount(hereTooRows.length);
 
+          let locatedHereToo = [];
           if (hereTooRows.length > 0) {
             const clipIds = hereTooRows.map(r => r.clip_id).filter(Boolean);
-            const { data: hereTooClipData } = await supabase
-              .from('clips')
-              .select('*')
-              .in('id', clipIds);
-            const located = (hereTooClipData ?? []).filter(c => c.latitude != null && c.longitude != null);
-            setHereTooClips(located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null })));
+            const { data: hereTooClipData } = await supabase.from('clips').select('*').in('id', clipIds);
+            locatedHereToo = (hereTooClipData ?? []).filter(c => c.latitude != null && c.longitude != null);
+            setHereTooClips(locatedHereToo.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null })));
+
+            // Fetch owner profiles for hereToo clips
+            const ownerIds = [...new Set(locatedHereToo.map(c => c.user_id))].filter(Boolean);
+            if (ownerIds.length > 0) {
+              const { data: profilesData } = await supabase.from('profiles').select('*').in('id', ownerIds);
+              const profileMap = {};
+              (profilesData ?? []).forEach(p => { profileMap[p.id] = p; });
+              setOwnerProfiles(profileMap);
+            }
           } else {
             setHereTooClips([]);
           }
 
           const data = clipsResult.data ?? [];
           setAllClips(data);
-
           const located = data.filter(c => c.latitude != null && c.longitude != null);
           console.log('Clips fetched:', located.length, 'with GPS coordinates');
-
           const withThumb = located.map(c => ({ ...c, thumbnailUri: c.thumbnail_url ?? null }));
           setClips(withThumb);
+
+          // Remove pending clips now confirmed in Supabase
+          const supabaseTs = new Set(data.map(c => c.timestamp));
+          pendingClips.filter(p => supabaseTs.has(p.timestamp)).forEach(p => removePendingClip(p.localId));
 
           for (const clip of withThumb) {
             if (clip.thumbnail_url) continue;
             resolveThumbnail(clip, user.id);
           }
+
+          // Fit map to show all clips on every focus
+          fitToAllClips(located, locatedHereToo);
         } catch (err) {
           console.error('Failed to fetch map data:', err.message);
         }
       };
-
       fetchAll();
     }, [])
   );
@@ -297,76 +535,83 @@ export default function MapScreen() {
   const resolveThumbnail = async (clip, userId) => {
     try {
       const { data: signedData, error: signedError } = await supabase.storage
-        .from('clips')
-        .createSignedUrl(clip.uri, 3600);
+        .from('clips').createSignedUrl(clip.uri, 3600);
       if (signedError) throw signedError;
 
-      console.log('Signed URL length:', signedData.signedUrl.length);
-      console.log('Signed URL preview:', signedData.signedUrl.slice(0, 50));
-      console.log('Full signed URL:', signedData.signedUrl);
-
-      const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(
-        signedData.signedUrl,
-        { time: 1000 }
-      );
-
+      const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(signedData.signedUrl, { time: 1000 });
       const thumbBlob = await fetch(thumbUri).then(r => r.blob());
       const thumbPath = `${userId}/thumb_${clip.timestamp}.jpg`;
 
       const { error: uploadError } = await supabase.storage
-        .from('thumbnails')
-        .upload(thumbPath, thumbBlob, { contentType: 'image/jpeg' });
-      if (uploadError) throw uploadError;
+        .from('thumbnails').upload(thumbPath, thumbBlob, { contentType: 'image/jpeg' });
+      if (uploadError && uploadError.statusCode !== '409') throw uploadError;
 
-      const { data: { publicUrl } } = supabase.storage
-        .from('thumbnails')
-        .getPublicUrl(thumbPath);
+      const { data: { publicUrl } } = supabase.storage.from('thumbnails').getPublicUrl(thumbPath);
 
-      const { error: updateError } = await supabase
-        .from('clips')
-        .update({ thumbnail_url: publicUrl })
-        .eq('id', clip.id);
+      const { error: updateError } = await supabase.from('clips')
+        .update({ thumbnail_url: publicUrl }).eq('id', clip.id);
       if (updateError) throw updateError;
 
-      setClips(prev =>
-        prev.map(c => c.id === clip.id ? { ...c, thumbnailUri: publicUrl } : c)
-      );
+      setClips(prev => prev.map(c => c.id === clip.id ? { ...c, thumbnailUri: publicUrl } : c));
     } catch (err) {
       console.error('Thumbnail resolution failed for clip', clip.id, ':', err.message);
-      console.error('Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
     }
   };
 
-  const handleClusterTap = async (cluster) => {
-    const resolved = await Promise.all(
-      cluster.clips.map(async (clip) => {
-        try {
-          const { data, error } = await supabase.storage
-            .from('clips')
-            .createSignedUrl(clip.uri, 3600);
-          if (error) throw error;
-          return { ...clip, playbackUri: data.signedUrl };
-        } catch (err) {
-          console.error('Skipping clip', clip.id, '- signed URL failed:', err.message);
-          return null;
-        }
-      })
-    );
+  const resolveClipUri = async (clip) => {
+    if (clip.isLocal) return { ...clip, playbackUri: clip.uri };
+    const { data, error } = await supabase.storage.from('clips').createSignedUrl(clip.uri, 3600);
+    if (error) throw error;
+    return { ...clip, playbackUri: data.signedUrl };
+  };
 
-    const resolvedClips = resolved.filter(Boolean);
-
-    if (resolvedClips.length === 0) {
-      Alert.alert('No clips available');
+  const handleMarkerTap = async (cluster) => {
+    if (isDotMode) {
+      const targetZoom = zoomToResolveCluster(cluster);
+      const delta = deltaForZoom(targetZoom);
+      mapRef.current?.animateToRegion({
+        latitude: cluster.centroid.latitude,
+        longitude: cluster.centroid.longitude,
+        latitudeDelta: delta,
+        longitudeDelta: delta,
+      }, 500);
       return;
     }
+    if (cluster.clips.length === 1) {
+      try {
+        const resolved = await resolveClipUri(cluster.clips[0]);
+        setSelectedClip(resolved);
+      } catch (err) {
+        console.error('Clip URI failed:', err.message);
+      }
+    } else {
+      setActiveCluster(cluster);
+      setIsStripOpen(true);
+    }
+  };
 
-    setSelectedSingleClip(resolvedClips[0]);
-    setSelectedClips(resolvedClips.length > 1 ? resolvedClips : null);
+  const handleStripClose = () => {
+    setActiveCluster(null);
+    setIsStripOpen(false);
+  };
+
+  const handleStripSelectClip = async (clip) => {
+    try {
+      const resolved = await resolveClipUri(clip);
+      setSelectedClip(resolved);
+    } catch (err) {
+      console.error('Clip URI failed:', err.message);
+    }
+  };
+
+  const handleVideoClose = () => {
+    setSelectedClip(null);
   };
 
   return (
     <View style={{ flex: 1 }}>
       <MapView
+        ref={mapRef}
         style={StyleSheet.absoluteFillObject}
         mapType="mutedStandard"
         initialRegion={ADELAIDE}
@@ -379,45 +624,48 @@ export default function MapScreen() {
         showsScale={false}
         showsUserLocation={false}
         showsIndoors={false}
+        onRegionChangeComplete={(region) => {
+          const zoom = Math.round(Math.log2(360 / region.latitudeDelta) - 1);
+          setZoomLevel(Math.max(1, Math.min(20, zoom)));
+        }}
       >
-        {clusters.map(cluster => (
-          <Marker
-            key={cluster.id}
-            coordinate={cluster.centroid}
-            anchor={{ x: 0.5, y: 1 }}
-            tracksViewChanges={cluster.clips.some(c => c.thumbnailUri === null)}
-            onPress={() => handleClusterTap(cluster)}
-          >
-            {cluster.clips.length === 1 ? (
-              <Pin thumbnailUri={cluster.clips[0].thumbnailUri} />
-            ) : (
-              <ClusterPin
-                thumbnailUri={cluster.clips[cluster.clips.length - 1].thumbnailUri}
-                count={cluster.clips.length}
-              />
-            )}
-          </Marker>
-        ))}
-        {hereTooClips.map(clip => (
-          <Marker
-            key={`heretoo_${clip.id}`}
-            coordinate={{ latitude: clip.latitude, longitude: clip.longitude }}
-            anchor={{ x: 0.5, y: 1 }}
-            tracksViewChanges={clip.thumbnailUri === null}
-            onPress={async () => {
-              try {
-                const { data, error } = await supabase.storage.from('clips').createSignedUrl(clip.uri, 3600);
-                if (error) throw error;
-                setSelectedSingleClip({ ...clip, playbackUri: data.signedUrl });
-                setSelectedClips(null);
-              } catch (err) {
-                console.error('HereToo signed URL failed:', err.message);
-              }
-            }}
-          >
-            <HereTooPin thumbnailUri={clip.thumbnailUri} />
-          </Marker>
-        ))}
+        {clusters.map(cluster => {
+          const frontClip = cluster.clips[0];
+          const frontHereToo = frontClip.hereToo ?? false;
+          const stackW = size + CLUSTER_STEP_X * 2;
+          const isMulti = cluster.clips.length > 1;
+          const anchorX = isMulti ? (stackW - size / 2) / stackW : 0.5;
+
+          return (
+            <Marker
+              key={cluster.id}
+              coordinate={cluster.centroid}
+              anchor={{ x: anchorX, y: 1 }}
+              tracksViewChanges={cluster.clips.some(c => !c.thumbnailUri)}
+              onPress={() => handleMarkerTap(cluster)}
+            >
+              {isDotMode ? (
+                <DotPin hereToo={frontHereToo} />
+              ) : isMulti ? (
+                <ClusterPin
+                  thumbnailUri={frontClip.thumbnailUri}
+                  timestamp={frontClip.timestamp}
+                  count={cluster.clips.length}
+                  frontHereToo={frontHereToo}
+                  size={size}
+                />
+              ) : (
+                <PolaroidPin
+                  thumbnailUri={frontClip.thumbnailUri}
+                  timestamp={frontClip.timestamp}
+                  hereToo={frontHereToo}
+                  ownerProfile={frontHereToo ? ownerProfiles[frontClip.user_id] : null}
+                  size={size}
+                />
+              )}
+            </Marker>
+          );
+        })}
       </MapView>
 
       <ProfileCard
@@ -443,31 +691,51 @@ export default function MapScreen() {
         }}
       />
 
-      {selectedSingleClip ? (
+      {activeCluster && !selectedClip && (
+        <ClusterStrip
+          cluster={activeCluster}
+          ownerProfiles={ownerProfiles}
+          onClose={handleStripClose}
+          onSelectClip={handleStripSelectClip}
+        />
+      )}
+
+      {selectedClip && (
         <VideoPlayer
-          clip={selectedSingleClip}
-          clips={selectedClips}
-          onClose={() => { setSelectedSingleClip(null); setSelectedClips(null); }}
+          clip={selectedClip}
+          clips={null}
+          onClose={handleVideoClose}
           onDelete={refreshClips}
         />
-      ) : null}
+      )}
     </View>
   );
 }
 
-// --- Styles ---
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const dotPinStyles = StyleSheet.create({
+  dot: {
+    width: 11,
+    height: 11,
+    borderRadius: 5.5,
+    borderWidth: 1,
+    borderColor: 'rgba(31,31,31,0.4)',
+  },
+});
+
 
 const pinStyles = StyleSheet.create({
   container: {
     alignItems: 'center',
   },
-  box: {
-    width: 38,
-    height: 38,
-    borderRadius: 8,
-    borderWidth: 1.5,
-    borderColor: COLORS.accent,
+  frame: {
+    borderRadius: 3,
     overflow: 'hidden',
+  },
+  imageWrapper: {
+    overflow: 'hidden',
+    borderRadius: 1,
   },
   image: {
     width: '100%',
@@ -475,72 +743,139 @@ const pinStyles = StyleSheet.create({
   },
   placeholder: {
     flex: 1,
-    backgroundColor: COLORS.accent,
+    backgroundColor: COLORS.secondary,
+    opacity: 0.4,
+  },
+  cornerBadge: {
+    position: 'absolute',
+    backgroundColor: COLORS.secondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 3,
+    borderWidth: 1,
+    borderColor: 'rgba(31,31,31,0.3)',
+  },
+  cornerBadgeText: {
+    color: '#F5F1E8',
+    fontWeight: '700',
+    fontFamily: STAMP_FONT,
+  },
+  strip: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dateText: {
+    fontFamily: STAMP_FONT,
+    fontWeight: '600',
+    letterSpacing: 0.5,
   },
   stem: {
     width: 2,
     height: 8,
-    backgroundColor: COLORS.accent,
+    backgroundColor: COLORS.secondary,
   },
   dot: {
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: COLORS.accent,
-  },
-});
-
-const hereTooStyles = StyleSheet.create({
-  box: {
-    width: 38,
-    height: 38,
-    borderRadius: 8,
-    borderWidth: 1.5,
-    borderColor: HERE_TOO_COLOR,
-    overflow: 'hidden',
-  },
-  placeholder: {
-    flex: 1,
-    backgroundColor: HERE_TOO_COLOR,
-  },
-  stem: {
-    width: 2,
-    height: 8,
-    backgroundColor: HERE_TOO_COLOR,
-  },
-  dot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: HERE_TOO_COLOR,
+    backgroundColor: COLORS.secondary,
   },
 });
 
 const clusterPinStyles = StyleSheet.create({
-  box: {
-    width: 42,
-    height: 42,
-    borderRadius: 8,
-    borderWidth: 1.5,
-    borderColor: COLORS.accent,
+  outerContainer: {
+    alignItems: 'flex-start',
+  },
+  frame: {
+    position: 'absolute',
+    borderRadius: 3,
+    borderWidth: 1,
+    borderColor: '#1F1F1F',
     overflow: 'hidden',
   },
-  badge: {
-    position: 'absolute',
-    top: 4,
-    left: 4,
-    width: 18,
-    height: 18,
-    borderRadius: 9,
-    backgroundColor: COLORS.accent,
+  strip: {
     alignItems: 'center',
     justifyContent: 'center',
   },
+  badge: {
+    position: 'absolute',
+    top: 5,
+    left: 5,
+    minWidth: 16,
+    height: 16,
+    paddingHorizontal: 3,
+    borderRadius: 8,
+    backgroundColor: '#F5F1E8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 3,
+  },
   badgeText: {
-    color: '#fff',
-    fontSize: 10,
+    color: COLORS.accent,
+    fontSize: 9,
     fontWeight: '700',
-    lineHeight: 18,
+  },
+});
+
+const stripStyles = StyleSheet.create({
+  container: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(31,31,31,0.97)',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderTopWidth: 0.5,
+    borderColor: 'rgba(245,241,232,0.1)',
+    paddingBottom: 28,
+  },
+  handleRow: {
+    height: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  handle: {
+    width: 36,
+    height: 3,
+    borderRadius: 1.5,
+    backgroundColor: 'rgba(245,241,232,0.2)',
+  },
+  closeBtn: {
+    position: 'absolute',
+    right: 18,
+    top: 9,
+  },
+  scrollContent: {
+    paddingHorizontal: 16,
+    paddingBottom: 4,
+  },
+  thumbFrame: {
+    borderRadius: 3,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#1F1F1F',
+  },
+  thumbAvatar: {
+    position: 'absolute',
+    backgroundColor: COLORS.secondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2,
+    borderWidth: 1,
+    borderColor: 'rgba(31,31,31,0.3)',
+  },
+  thumbAvatarText: {
+    color: '#F5F1E8',
+    fontWeight: '700',
+    fontFamily: STAMP_FONT,
+  },
+  thumbDate: {
+    fontFamily: STAMP_FONT,
+    fontWeight: '600',
+    letterSpacing: 0.5,
   },
 });
 
@@ -576,22 +911,26 @@ const styles = StyleSheet.create({
   },
   circleBadge: {
     position: 'absolute',
-    bottom: 0,
-    right: 0,
-    width: 18,
-    height: 18,
-    borderRadius: 9,
+    bottom: -2,
+    right: -2,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
     backgroundColor: '#1F1F1F',
-    borderWidth: 1,
+    borderWidth: 1.5,
     borderColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
   },
   circleBadgeText: {
     color: COLORS.accent,
-    fontSize: 9,
+    fontSize: 10,
     fontFamily: STAMP_FONT,
-    lineHeight: 11,
+    fontWeight: '600',
+    includeFontPadding: false,
+    textAlignVertical: 'center',
+    marginLeft: 0.5,
+    marginTop: 0.5,
   },
   name: {
     color: COLORS.text,

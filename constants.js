@@ -16,7 +16,16 @@ export const COLORS = {
 
 export const STAMP_FONT = 'Courier New';
 
-export const RecordingContext = createContext({ isRecording: false, setIsRecording: () => {} });
+export const RecordingContext = createContext({
+  isRecording: false,
+  setIsRecording: () => {},
+  pendingClips: [],
+  addPendingClip: () => {},
+  upgradePendingClip: () => {},
+  removePendingClip: () => {},
+  isStripOpen: false,
+  setIsStripOpen: () => {},
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

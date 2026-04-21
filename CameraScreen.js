@@ -15,7 +15,7 @@ export default function CameraScreen() {
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
   const [locationPermission, requestLocationPermission] = Location.useForegroundPermissions();
   const [isRecording, setIsRecording] = useState(false);
-  const { setIsRecording: setGlobalRecording } = useContext(RecordingContext);
+  const { setIsRecording: setGlobalRecording, addPendingClip, upgradePendingClip } = useContext(RecordingContext);
 
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
 
@@ -24,6 +24,7 @@ export default function CameraScreen() {
 
   const recFlash = useRef(new Animated.Value(0)).current;
   const recAnim = useRef(null);
+  const pressAnim = useRef(new Animated.Value(0)).current;
 
   const cameraRef = useRef(null);
   const isRecordingRef = useRef(false);
@@ -70,6 +71,37 @@ export default function CameraScreen() {
     }
   }, [isRecording]);
 
+  // pressAnim: 0 = idle, 1 = fully pressed
+  const dotScale = pressAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [1, 1.40], // 68px → ~95px, fills 90px ring + slight overshoot
+    extrapolate: 'clamp',
+  });
+  const ringOpacity = pressAnim.interpolate({
+    inputRange: [0, 0.6, 0.88],
+    outputRange: [1, 0.25, 0],
+    extrapolate: 'clamp',
+  });
+  const haloOpacity = pressAnim.interpolate({
+    inputRange: [0, 0.5, 0.72, 1],
+    outputRange: [0, 0, 0.55, 0.40],
+    extrapolate: 'clamp',
+  });
+  const haloScale = pressAnim.interpolate({
+    inputRange: [0, 0.7, 1],
+    outputRange: [1, 1.1, 1.22], // 90px → ~110px, settles just outside terracotta dot
+    extrapolate: 'clamp',
+  });
+
+  const handlePressIn = () => {
+    Animated.timing(pressAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+    startRecording();
+  };
+  const handlePressOut = () => {
+    Animated.timing(pressAnim, { toValue: 0, duration: 300, useNativeDriver: true }).start();
+    stopRecording();
+  };
+
   const getLocation = async () => {
     try {
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
@@ -108,7 +140,7 @@ export default function CameraScreen() {
     return { uri: destFile.uri, timestamp };
   };
 
-  const uploadClip = async (localUri, timestamp, location, duration) => {
+  const uploadClip = async (localUri, localThumbUri, timestamp, location, duration, localId) => {
     try {
       const { data: { user }, error: userError } = await supabase.auth.getUser();
       if (userError || !user) throw userError ?? new Error('No user');
@@ -123,30 +155,33 @@ export default function CameraScreen() {
 
       const { error: uploadError } = await supabase.storage
         .from('clips')
-        .upload(storagePath, bytes.buffer, { contentType: 'video/mp4' });
+        .upload(storagePath, bytes.buffer, { contentType: 'video/mp4', upsert: true });
       if (uploadError) throw uploadError;
 
-      const { data: insertData, error: insertError } = await supabase.from('clips').insert({
+      const { data: insertData, error: insertError } = await supabase.from('clips').upsert({
         user_id: user.id,
         uri: storagePath,
         timestamp,
         duration,
         latitude: location?.latitude ?? null,
         longitude: location?.longitude ?? null,
-      }).select();
+      }, { onConflict: 'uri', ignoreDuplicates: true }).select();
       if (insertError) throw insertError;
 
-      const insertedClip = insertData[0];
+      const insertedClip = insertData?.[0];
+      if (!insertedClip) {
+        // clip already existed — swap to remote URI, skip thumbnail
+        upgradePendingClip(localId, { uri: storagePath, isLocal: false });
+        return;
+      }
       console.log('Cloud upload complete:', storagePath);
 
-      // Thumbnail — generated from local file while it's still on device
+      // Thumbnail — use the already-generated local thumb, no re-generation needed
       try {
-        const thumbnailResult = await VideoThumbnails.getThumbnailAsync(localUri, { time: 0 });
-        console.log('Thumbnail URI:', thumbnailResult.uri);
+        if (!localThumbUri) throw new Error('No local thumbnail');
 
-        const base64 = await FileSystemLegacy.readAsStringAsync(thumbnailResult.uri, { encoding: 'base64' });
+        const base64 = await FileSystemLegacy.readAsStringAsync(localThumbUri, { encoding: 'base64' });
         console.log('Base64 length:', base64.length);
-        console.log('Base64 preview:', base64.slice(0, 100));
         const binaryString = atob(base64);
         const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
@@ -168,8 +203,10 @@ export default function CameraScreen() {
         if (thumbUpdateError) throw thumbUpdateError;
 
         console.log('Thumbnail uploaded and linked:', thumbPath);
+        upgradePendingClip(localId, { id: insertedClip.id, uri: storagePath, thumbnailUri: publicUrl, isLocal: false });
       } catch (thumbErr) {
         console.error('Thumbnail failed (clip preserved):', thumbErr.message);
+        upgradePendingClip(localId, { id: insertedClip.id, uri: storagePath, isLocal: false });
       }
     } catch (err) {
       console.error('Cloud upload failed (local clip preserved):', err.message);
@@ -195,7 +232,31 @@ export default function CameraScreen() {
         const duration = Math.round((Date.now() - recordingStartTime.current) / 1000);
         console.log('Duration:', duration, 'seconds');
         const { uri: localUri, timestamp } = await saveClip(result.uri, location, duration);
-        uploadClip(localUri, timestamp, location, duration);
+
+        // Generate thumbnail locally first
+        let localThumbUri = null;
+        try {
+          const thumbResult = await VideoThumbnails.getThumbnailAsync(localUri, { time: 0 });
+          localThumbUri = thumbResult.uri;
+        } catch (_) {}
+
+        // Local-first: pin appears on map immediately
+        const localId = `local_${timestamp}`;
+        if (location) {
+          addPendingClip({
+            localId,
+            id: null,
+            uri: localUri,
+            latitude: location.latitude,
+            longitude: location.longitude,
+            timestamp,
+            duration,
+            thumbnailUri: localThumbUri,
+            isLocal: true,
+          });
+        }
+
+        uploadClip(localUri, localThumbUri, timestamp, location, duration, localId);
       } catch (error) {
         console.error('Recording error:', error);
       }
@@ -235,6 +296,7 @@ export default function CameraScreen() {
         style={{ position: 'absolute', top: 0, left: 0, width: screenWidth, height: screenHeight }}
         mode="video"
         facing="back"
+        zoom={0.01}
       />
 
       <View style={stampStyles.topLeft} pointerEvents="none">
@@ -250,11 +312,13 @@ export default function CameraScreen() {
 
       <View style={styles.buttonRow}>
         <Pressable
-          onPressIn={startRecording}
-          onPressOut={stopRecording}
-          style={isRecording ? styles.recordOuterActive : styles.recordOuter}
+          onPressIn={handlePressIn}
+          onPressOut={handlePressOut}
+          style={styles.buttonWrapper}
         >
-          <View style={isRecording ? styles.recordInnerActive : styles.recordInner} />
+          <Animated.View style={[styles.halo, { opacity: haloOpacity, transform: [{ scale: haloScale }] }]} />
+          <Animated.View style={[styles.recordOuter, { opacity: ringOpacity }]} />
+          <Animated.View style={[styles.recordInner, { transform: [{ scale: dotScale }] }]} />
         </Pressable>
       </View>
     </View>
@@ -296,36 +360,33 @@ const styles = StyleSheet.create({
     right: 0,
     alignItems: 'center',
   },
+  buttonWrapper: {
+    width: 130,
+    height: 130,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  halo: {
+    position: 'absolute',
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    backgroundColor: '#F5F1E8',
+  },
   recordOuter: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
+    position: 'absolute',
+    width: 90,
+    height: 90,
+    borderRadius: 45,
     borderWidth: 3,
     borderColor: COLORS.accent,
     backgroundColor: 'transparent',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  recordOuterActive: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    borderWidth: 3,
-    borderColor: COLORS.text,
-    backgroundColor: COLORS.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   recordInner: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: COLORS.accent,
-  },
-  recordInnerActive: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
+    position: 'absolute',
+    width: 68,
+    height: 68,
+    borderRadius: 34,
     backgroundColor: COLORS.accent,
   },
 });

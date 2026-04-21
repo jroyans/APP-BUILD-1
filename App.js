@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Animated, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator, BottomTabBar } from '@react-navigation/bottom-tabs';
@@ -38,19 +38,20 @@ function MapIcon({ color }) {
 // ─── Animated tab bar ─────────────────────────────────────────────────────────
 
 function AnimatedTabBar(props) {
-  const { isRecording } = useContext(RecordingContext);
+  const { isRecording, isStripOpen } = useContext(RecordingContext);
   const translateY = useRef(new Animated.Value(0)).current;
-  const prevRecording = useRef(false);
+  const hidden = isRecording || isStripOpen;
+  const prevHidden = useRef(false);
 
   useEffect(() => {
-    if (isRecording === prevRecording.current) return;
-    prevRecording.current = isRecording;
+    if (hidden === prevHidden.current) return;
+    prevHidden.current = hidden;
     Animated.timing(translateY, {
-      toValue: isRecording ? 60 : 0,
+      toValue: hidden ? 60 : 0,
       duration: 200,
       useNativeDriver: true,
     }).start();
-  }, [isRecording]);
+  }, [hidden]);
 
   return (
     <Animated.View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, transform: [{ translateY }] }}>
@@ -64,6 +65,20 @@ function AnimatedTabBar(props) {
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [session, setSession] = useState(undefined);
+  const [pendingClips, setPendingClips] = useState([]);
+  const [isStripOpen, setIsStripOpen] = useState(false);
+
+  const addPendingClip = useCallback((clip) => {
+    setPendingClips(prev => [...prev, clip]);
+  }, []);
+
+  const upgradePendingClip = useCallback((localId, remoteData) => {
+    setPendingClips(prev => prev.map(c => c.localId === localId ? { ...c, ...remoteData } : c));
+  }, []);
+
+  const removePendingClip = useCallback((localId) => {
+    setPendingClips(prev => prev.filter(c => c.localId !== localId));
+  }, []);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -86,7 +101,7 @@ export default function App() {
   }
 
   return (
-    <RecordingContext.Provider value={{ isRecording, setIsRecording }}>
+    <RecordingContext.Provider value={{ isRecording, setIsRecording, pendingClips, addPendingClip, upgradePendingClip, removePendingClip, isStripOpen, setIsStripOpen }}>
       <NavigationContainer>
         <Tab.Navigator
           tabBar={props => <AnimatedTabBar {...props} />}
