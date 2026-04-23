@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Animated, Image, Modal, Pressable,
+  Animated, Image, Pressable,
   ScrollView, StyleSheet, Text, useWindowDimensions, View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -11,6 +11,7 @@ import { COLORS, RecordingContext } from './constants';
 import { supabase } from './supabase';
 import VideoPlayer from './VideoPlayer';
 import CircleScreen from './CircleScreen';
+import SettingsScreen from './SettingsScreen';
 
 const STAMP_FONT = 'Courier New';
 
@@ -102,7 +103,8 @@ function clusterThresholdForZoom(zoom) {
 
 // Own + HereToo clips merged into unified clusters.
 // Each clip must have { latitude, longitude, timestamp, hereToo? }
-function buildClusters(clips, zoom) {
+function buildClusters(clips, latitudeDelta) {
+  const zoom = Math.log2(360 / latitudeDelta) - 1;
   const threshold = clusterThresholdForZoom(zoom);
   const used = new Set();
   const clusters = [];
@@ -133,8 +135,9 @@ function buildClusters(clips, zoom) {
   return clusters;
 }
 
-// Pin size: 64px at Z14, scales with zoom, capped 44–100px
-function pinSize(zoom) {
+// Pin size: 64px at latitudeDelta ≈ 0.05 (zoom 14), scales continuously, capped 44–100px
+function pinSize(latitudeDelta) {
+  const zoom = Math.log2(360 / latitudeDelta) - 1;
   return Math.min(100, Math.max(44, Math.round(64 * (1 + (zoom - 14) * 0.12))));
 }
 
@@ -150,6 +153,7 @@ function DotPin({ hereToo }) {
 }
 
 function PolaroidPin({ thumbnailUri, timestamp, hereToo = false, ownerProfile = null, size = 64 }) {
+  const [badgeError, setBadgeError] = useState(false);
   const frameColor = hereToo ? '#F5F1E8' : COLORS.accent;
   const stripColor = hereToo ? '#FFFFFF' : COLORS.accent;
   const dateColor = hereToo ? COLORS.secondary : '#F5F1E8';
@@ -169,10 +173,11 @@ function PolaroidPin({ thumbnailUri, timestamp, hereToo = false, ownerProfile = 
           )}
         </View>
         {hereToo && ownerProfile && (
-          <View style={[pinStyles.cornerBadge, { top: pad, left: pad, width: avatarSize, height: avatarSize, borderRadius: avatarSize / 2 }]}>
-            <Text style={[pinStyles.cornerBadgeText, { fontSize: Math.max(6, Math.round(avatarSize * 0.42)) }]}>
-              {getInitials(ownerProfile.full_name, ownerProfile.username)}
-            </Text>
+          <View style={[pinStyles.cornerBadge, { top: pad, left: pad, width: avatarSize, height: avatarSize, borderRadius: avatarSize / 2, overflow: 'hidden' }]}>
+            {ownerProfile.avatar_url && !badgeError
+              ? <Image source={{ uri: ownerProfile.avatar_url }} style={{ width: avatarSize, height: avatarSize }} onError={() => setBadgeError(true)} />
+              : <Text style={[pinStyles.cornerBadgeText, { fontSize: Math.max(6, Math.round(avatarSize * 0.42)) }]}>{getInitials(ownerProfile.full_name, ownerProfile.username)}</Text>
+            }
           </View>
         )}
         <View style={[pinStyles.strip, { height: stripH, backgroundColor: stripColor }]}>
@@ -246,6 +251,13 @@ function ClusterPin({ thumbnailUri, timestamp, count, frontHereToo = false, size
 
 // ─── Cluster strip ─────────────────────────────────────────────────────────────
 
+function ThumbAvatar({ ownerProfile, size }) {
+  const [imgError, setImgError] = useState(false);
+  return ownerProfile.avatar_url && !imgError
+    ? <Image source={{ uri: ownerProfile.avatar_url }} style={{ width: size, height: size }} onError={() => setImgError(true)} />
+    : <Text style={[stripStyles.thumbAvatarText, { fontSize: Math.max(6, Math.round(size * 0.42)) }]}>{getInitials(ownerProfile.full_name, ownerProfile.username)}</Text>;
+}
+
 function ClusterStrip({ cluster, ownerProfiles, onClose, onSelectClip }) {
   const { width: screenW } = useWindowDimensions();
   const slideAnim = useRef(new Animated.Value(300)).current;
@@ -297,11 +309,9 @@ function ClusterStrip({ cluster, ownerProfiles, onClose, onSelectClip }) {
                 {isHereToo && ownerProfile && (
                   <View style={[stripStyles.thumbAvatar, {
                     width: AVATAR_SIZE, height: AVATAR_SIZE, borderRadius: AVATAR_SIZE / 2,
-                    top: PAD, left: PAD,
+                    top: PAD, left: PAD, overflow: 'hidden',
                   }]}>
-                    <Text style={[stripStyles.thumbAvatarText, { fontSize: Math.max(6, Math.round(AVATAR_SIZE * 0.42)) }]}>
-                      {getInitials(ownerProfile.full_name, ownerProfile.username)}
-                    </Text>
+                    <ThumbAvatar ownerProfile={ownerProfile} size={AVATAR_SIZE} />
                   </View>
                 )}
                 <View style={{ height: DATE_H, alignItems: 'center', justifyContent: 'center' }}>
@@ -318,37 +328,11 @@ function ClusterStrip({ cluster, ownerProfiles, onClose, onSelectClip }) {
   );
 }
 
-// ─── Settings modal ────────────────────────────────────────────────────────────
-
-function SettingsModal({ visible, onClose }) {
-  const handleSignOut = async () => {
-    try {
-      await supabase.auth.signOut();
-    } catch (err) {
-      console.error('Sign out failed:', err.message);
-    }
-  };
-
-  return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <View style={settingsModalStyles.overlay}>
-        <View style={settingsModalStyles.card}>
-          <Text style={settingsModalStyles.title}>settings</Text>
-          <Pressable style={settingsModalStyles.signOutButton} onPress={handleSignOut}>
-            <Text style={settingsModalStyles.signOutText}>sign out</Text>
-          </Pressable>
-          <Pressable onPress={onClose}>
-            <Text style={settingsModalStyles.cancelText}>cancel</Text>
-          </Pressable>
-        </View>
-      </View>
-    </Modal>
-  );
-}
 
 // ─── Profile card ──────────────────────────────────────────────────────────────
 
-function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereTooCount, onCirclePress, onSettingsPress }) {
+function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereTooCount, pendingRequestCount, onCirclePress, onSettingsPress }) {
+  const [avatarError, setAvatarError] = useState(false);
   const initials = getInitials(profile?.full_name, profile?.username);
   const displayName = profile?.full_name || profile?.username || '—';
   const location = profile?.home_location || 'Adelaide, Australia';
@@ -357,7 +341,10 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
       <View style={styles.avatarRow}>
         <View style={{ width: 42, height: 42, marginRight: 13 }}>
           <View style={styles.avatar}>
-            <Text style={styles.avatarInitials}>{initials}</Text>
+            {profile?.avatar_url && !avatarError
+              ? <Image source={{ uri: profile.avatar_url }} style={styles.avatarImage} onError={() => setAvatarError(true)} />
+              : <Text style={styles.avatarInitials}>{initials}</Text>
+            }
           </View>
           <View style={styles.circleBadge}>
             <Text style={styles.circleBadgeText}>{circleCount}</Text>
@@ -365,12 +352,16 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
         </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.name} numberOfLines={1}>{displayName}</Text>
+          {profile?.username ? <Text style={styles.location} numberOfLines={1}>@{profile.username}</Text> : null}
           <Text style={styles.location} numberOfLines={1}>{location}</Text>
         </View>
         <View style={styles.iconRow}>
-          <Pressable style={styles.iconButtonSecondary} onPress={onCirclePress}>
-            <Ionicons name="people" size={20} color="#fff" />
-          </Pressable>
+          <View>
+            <Pressable style={styles.iconButtonSecondary} onPress={onCirclePress}>
+              <Ionicons name="people" size={20} color="#fff" />
+            </Pressable>
+            {pendingRequestCount > 0 && <View style={styles.requestDot} />}
+          </View>
           <Pressable style={styles.iconButtonAccent} onPress={onSettingsPress}>
             <Ionicons name="settings" size={20} color="#fff" />
           </Pressable>
@@ -378,11 +369,20 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
       </View>
       <View style={styles.divider} />
       <View style={styles.statsRow}>
-        <Text style={styles.stat}>{momentCount} moments</Text>
-        <Text style={styles.statDot}> · </Text>
-        <Text style={styles.stat}>{formatDuration(totalDuration)}</Text>
-        <Text style={styles.statDot}> · </Text>
-        <Text style={styles.stat}>{hereTooCount} here too</Text>
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{momentCount}</Text>
+          <Text style={styles.statLabel}>moments</Text>
+        </View>
+        <View style={styles.statCardDivider} />
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{formatDuration(totalDuration)}</Text>
+          <Text style={styles.statLabel}>recorded</Text>
+        </View>
+        <View style={styles.statCardDivider} />
+        <View style={styles.statCard}>
+          <Text style={styles.statValue}>{hereTooCount}</Text>
+          <Text style={styles.statLabel}>here too</Text>
+        </View>
       </View>
     </View>
   );
@@ -390,25 +390,25 @@ function ProfileCard({ profile, momentCount, totalDuration, circleCount, hereToo
 
 // ─── Main screen ───────────────────────────────────────────────────────────────
 
-export default function MapScreen() {
+export default function MapScreen({ navigation }) {
   const [clips, setClips] = useState([]);
   const [hereTooClips, setHereTooClips] = useState([]);
   const [hereTooCount, setHereTooCount] = useState(0);
-  const [profile, setProfile] = useState(null);
   const [allClips, setAllClips] = useState([]);
   const [circleCount, setCircleCount] = useState(0);
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
   const [ownerProfiles, setOwnerProfiles] = useState({});
   const [showCircle, setShowCircle] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [zoomLevel, setZoomLevel] = useState(14);
+  const [latitudeDelta, setLatitudeDelta] = useState(0.05);
   const [activeCluster, setActiveCluster] = useState(null);
   const [selectedClip, setSelectedClip] = useState(null);
   const currentUserIdRef = useRef(null);
   const mapRef = useRef(null);
 
-  const { pendingClips, removePendingClip, setIsStripOpen } = useContext(RecordingContext);
+  const { pendingClips, removePendingClip, setIsStripOpen, profile, setProfile } = useContext(RecordingContext);
 
-  const isDotMode = zoomLevel < DOT_MODE_THRESHOLD;
+  const isDotMode = Math.log2(360 / latitudeDelta) - 1 < DOT_MODE_THRESHOLD;
 
   const supabaseTimestamps = useMemo(() => new Set(clips.map(c => c.timestamp)), [clips]);
   const mergedOwnClips = useMemo(() => {
@@ -424,8 +424,8 @@ export default function MapScreen() {
     ...hereTooClips.map(c => ({ ...c, hereToo: true })),
   ], [mergedOwnClips, hereTooClips]);
 
-  const clusters = useMemo(() => buildClusters(allClipsForMap, zoomLevel), [allClipsForMap, zoomLevel]);
-  const size = pinSize(zoomLevel);
+  const clusters = useMemo(() => buildClusters(allClipsForMap, latitudeDelta), [allClipsForMap, latitudeDelta]);
+  const size = pinSize(latitudeDelta);
 
   const momentCount = allClips.length;
   const totalDuration = allClips.reduce((sum, c) => sum + (c.duration ?? 0), 0);
@@ -474,14 +474,16 @@ export default function MapScreen() {
           if (userError || !user) throw userError ?? new Error('No user');
           currentUserIdRef.current = user.id;
 
-          const [profileResult, clipsResult, circleResult, hereTooResult] = await Promise.all([
-            supabase.from('profiles').select('*').eq('id', user.id).single(),
+          const [clipsResult, circleResult, hereTooResult, pendingCircleResult, pendingHereTooResult] = await Promise.all([
             supabase.from('clips').select('*').eq('user_id', user.id),
             supabase.from('circles').select('user_id, circle_member_id').or(`user_id.eq.${user.id},circle_member_id.eq.${user.id}`),
             supabase.from('here_too_requests').select('clip_id').eq('requester_id', user.id).eq('status', 'approved'),
+            supabase.from('circle_requests').select('id', { count: 'exact', head: true }).eq('receiver_id', user.id).eq('status', 'pending'),
+            supabase.from('here_too_requests').select('id', { count: 'exact', head: true }).eq('owner_id', user.id).eq('status', 'pending'),
           ]);
 
-          if (profileResult.data) setProfile(profileResult.data);
+          setPendingRequestCount((pendingCircleResult.count ?? 0) + (pendingHereTooResult.count ?? 0));
+
           setCircleCount(new Set((circleResult.data ?? []).map(r => r.user_id === user.id ? r.circle_member_id : r.user_id)).size);
 
           const hereTooRows = hereTooResult.data ?? [];
@@ -624,9 +626,8 @@ export default function MapScreen() {
         showsScale={false}
         showsUserLocation={false}
         showsIndoors={false}
-        onRegionChangeComplete={(region) => {
-          const zoom = Math.round(Math.log2(360 / region.latitudeDelta) - 1);
-          setZoomLevel(Math.max(1, Math.min(20, zoom)));
+        onRegionChange={(region) => {
+          setLatitudeDelta(region.latitudeDelta);
         }}
       >
         {clusters.map(cluster => {
@@ -674,14 +675,15 @@ export default function MapScreen() {
         totalDuration={totalDuration}
         circleCount={circleCount}
         hereTooCount={hereTooCount}
+        pendingRequestCount={pendingRequestCount}
         onCirclePress={() => setShowCircle(true)}
         onSettingsPress={() => setShowSettings(true)}
       />
-      <SettingsModal visible={showSettings} onClose={() => setShowSettings(false)} />
-
       <CircleScreen
         visible={showCircle}
         onClose={() => setShowCircle(false)}
+        onProfilePress={(userId) => { setShowCircle(false); navigation.navigate('FriendProfile', { userId }); }}
+        onPendingCountChange={(count) => setPendingRequestCount(count)}
         onCircleChanged={() => {
           const uid = profile?.id;
           if (!uid) return;
@@ -708,6 +710,11 @@ export default function MapScreen() {
           onDelete={refreshClips}
         />
       )}
+
+      <SettingsScreen
+        visible={showSettings}
+        onClose={() => setShowSettings(false)}
+      />
     </View>
   );
 }
@@ -909,6 +916,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '500',
   },
+  avatarImage: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+  },
   circleBadge: {
     position: 'absolute',
     bottom: -2,
@@ -954,6 +966,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  requestDot: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    width: 9,
+    height: 9,
+    borderRadius: 4.5,
+    backgroundColor: '#C86A4A',
+    borderWidth: 1.5,
+    borderColor: 'rgba(31,31,31,0.92)',
+  },
   iconButtonAccent: {
     width: 36,
     height: 36,
@@ -970,58 +993,30 @@ const styles = StyleSheet.create({
   statsRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-evenly',
   },
-  stat: {
-    color: COLORS.accent,
-    fontSize: 12,
-    fontFamily: STAMP_FONT,
-    letterSpacing: 0.04 * 12,
+  statCard: {
+    flex: 1,
+    alignItems: 'center',
   },
-  statDot: {
+  statValue: {
     color: COLORS.accent,
-    fontSize: 12,
+    fontSize: 22,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+  },
+  statLabel: {
+    color: COLORS.secondary,
+    fontSize: 11,
+    fontWeight: '400',
     fontFamily: STAMP_FONT,
+    marginTop: 2,
+  },
+  statCardDivider: {
+    width: 0.5,
+    height: 28,
+    backgroundColor: COLORS.secondary,
+    opacity: 0.3,
   },
 });
 
-const settingsModalStyles = StyleSheet.create({
-  overlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  card: {
-    backgroundColor: '#1F1F1F',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#333330',
-    padding: 24,
-    width: '80%',
-  },
-  title: {
-    color: '#F5F1E8',
-    fontSize: 15,
-    fontWeight: '500',
-    fontFamily: 'Courier New',
-    marginBottom: 20,
-  },
-  signOutButton: {
-    backgroundColor: '#2a2a2a',
-    borderRadius: 10,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  signOutText: {
-    color: '#E63946',
-    fontSize: 14,
-    fontFamily: 'Courier New',
-  },
-  cancelText: {
-    color: '#7A5C4D',
-    fontSize: 13,
-    fontFamily: 'Courier New',
-    textAlign: 'center',
-  },
-});

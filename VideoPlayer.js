@@ -3,6 +3,7 @@ import { useVideoPlayer, VideoView } from 'expo-video';
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Animated, Modal, PanResponder, Pressable, Share, StyleSheet, Text, View } from 'react-native';
 import { supabase } from './supabase';
+import VideoStamp from './components/VideoStamp';
 
 const FONT = 'Courier New';
 const TERRACOTTA = '#C86A4A';
@@ -176,6 +177,11 @@ export default function VideoPlayer({ clip, clips, onClose, onDelete }) {
           }}
           onLongPress={() => openSheetRef.current()}
           delayLongPress={400}
+        />
+
+        <VideoStamp
+          recordedAt={activeClip.recorded_at ?? activeClip.timestamp}
+          isPlaying={isPlaying}
         />
 
         {/* Cluster position indicator */}

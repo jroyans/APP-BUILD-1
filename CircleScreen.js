@@ -17,15 +17,19 @@ function getInitials(fullName, username) {
   return (username ?? '??').slice(0, 2).toUpperCase();
 }
 
-function Avatar({ fullName, username }) {
+function Avatar({ fullName, username, avatarUrl }) {
+  const [imgError, setImgError] = useState(false);
   return (
     <View style={styles.avatar}>
-      <Text style={styles.avatarText}>{getInitials(fullName, username)}</Text>
+      {avatarUrl && !imgError
+        ? <Image source={{ uri: avatarUrl }} style={styles.avatarImage} onError={() => setImgError(true)} />
+        : <Text style={styles.avatarText}>{getInitials(fullName, username)}</Text>
+      }
     </View>
   );
 }
 
-export default function CircleScreen({ visible, onClose, onCircleChanged }) {
+export default function CircleScreen({ visible, onClose, onCircleChanged, onProfilePress, onPendingCountChange }) {
   const insets = useSafeAreaInsets();
   const [currentUser, setCurrentUser] = useState(null);
   const [searchText, setSearchText] = useState('');
@@ -42,6 +46,10 @@ export default function CircleScreen({ visible, onClose, onCircleChanged }) {
   useEffect(() => {
     if (visible) fetchAll();
   }, [visible]);
+
+  useEffect(() => {
+    onPendingCountChange?.(requests.length + hereTooRequests.length);
+  }, [requests.length, hereTooRequests.length]);
 
   useEffect(() => {
     if (searchTimeout.current) clearTimeout(searchTimeout.current);
@@ -287,7 +295,7 @@ export default function CircleScreen({ visible, onClose, onCircleChanged }) {
                   const isPending = sentRequestIds.has(result.id);
                   return (
                     <View key={result.id} style={styles.userRow}>
-                      <Avatar fullName={result.full_name} username={result.username} />
+                      <Avatar fullName={result.full_name} username={result.username} avatarUrl={result.avatar_url} />
                       <View style={styles.userInfo}>
                         <Text style={styles.userName}>{result.full_name || result.username}</Text>
                         <Text style={styles.userMeta}>
@@ -333,7 +341,7 @@ export default function CircleScreen({ visible, onClose, onCircleChanged }) {
                 </View>
                 {requests.map(request => (
                   <View key={request.id} style={styles.userRow}>
-                    <Avatar fullName={request.profile?.full_name} username={request.profile?.username} />
+                    <Avatar fullName={request.profile?.full_name} username={request.profile?.username} avatarUrl={request.profile?.avatar_url} />
                     <View style={styles.userInfo}>
                       <Text style={styles.userName}>
                         {request.profile?.full_name || request.profile?.username || 'Unknown'}
@@ -417,8 +425,8 @@ export default function CircleScreen({ visible, onClose, onCircleChanged }) {
               <Text style={styles.emptyLabel}>no one in your circle yet</Text>
             ) : (
               circleMembers.map(member => (
-                <View key={member.memberId} style={styles.userRow}>
-                  <Avatar fullName={member.profile?.full_name} username={member.profile?.username} />
+                <Pressable key={member.memberId} style={styles.userRow} onPress={() => onProfilePress?.(member.memberId)}>
+                  <Avatar fullName={member.profile?.full_name} username={member.profile?.username} avatarUrl={member.profile?.avatar_url} />
                   <View style={styles.userInfo}>
                     <Text style={styles.userName}>
                       {member.profile?.full_name || member.profile?.username || 'Unknown'}
@@ -431,7 +439,7 @@ export default function CircleScreen({ visible, onClose, onCircleChanged }) {
                   <View style={styles.inCircleButton}>
                     <Text style={styles.inCircleText}>in circle</Text>
                   </View>
-                </View>
+                </Pressable>
               ))
             )}
           </View>
@@ -454,7 +462,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     color: COLORS.text,
-    fontSize: 16,
+    fontSize: 19,
     fontWeight: '500',
     marginRight: 8,
   },
@@ -468,7 +476,7 @@ const styles = StyleSheet.create({
   },
   countBadgeText: {
     color: '#fff',
-    fontSize: 11,
+    fontSize: 13,
     fontWeight: '600',
   },
   closeButton: {
@@ -481,7 +489,7 @@ const styles = StyleSheet.create({
   },
   closeButtonText: {
     color: COLORS.text,
-    fontSize: 20,
+    fontSize: 24,
     lineHeight: 24,
   },
   searchContainer: {
@@ -496,13 +504,13 @@ const styles = StyleSheet.create({
   },
   searchIcon: {
     color: COLORS.secondary,
-    fontSize: 16,
+    fontSize: 19,
     marginRight: 8,
   },
   searchInput: {
     flex: 1,
     color: COLORS.text,
-    fontSize: 14,
+    fontSize: 17,
     fontFamily: STAMP_FONT,
     padding: 0,
   },
@@ -518,7 +526,7 @@ const styles = StyleSheet.create({
   },
   sectionLabel: {
     color: COLORS.secondary,
-    fontSize: 14,
+    fontSize: 17,
     fontWeight: '600',
     fontFamily: STAMP_FONT,
     letterSpacing: 0.8,
@@ -535,7 +543,7 @@ const styles = StyleSheet.create({
   },
   requestsBadgeText: {
     color: '#fff',
-    fontSize: 10,
+    fontSize: 12,
     fontWeight: '600',
   },
   userRow: {
@@ -551,9 +559,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  avatarImage: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+  },
   avatarText: {
     color: COLORS.text,
-    fontSize: 13,
+    fontSize: 16,
     fontWeight: '500',
   },
   userInfo: {
@@ -562,12 +575,12 @@ const styles = StyleSheet.create({
   },
   userName: {
     color: COLORS.text,
-    fontSize: 14,
+    fontSize: 17,
     fontWeight: '500',
   },
   userMeta: {
     color: COLORS.secondary,
-    fontSize: 11,
+    fontSize: 13,
     fontFamily: STAMP_FONT,
     marginTop: 1,
   },
@@ -583,7 +596,7 @@ const styles = StyleSheet.create({
   },
   addButtonText: {
     color: '#fff',
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: '500',
   },
   requestedButton: {
@@ -595,18 +608,17 @@ const styles = StyleSheet.create({
   },
   requestedText: {
     color: COLORS.secondary,
-    fontSize: 12,
+    fontSize: 14,
   },
   inCircleButton: {
-    borderWidth: 1,
-    borderColor: COLORS.secondary,
+    backgroundColor: '#C86A4A',
     paddingHorizontal: 10,
     paddingVertical: 5,
     borderRadius: 6,
   },
   inCircleText: {
-    color: COLORS.secondary,
-    fontSize: 12,
+    color: '#F5F1E8',
+    fontSize: 14,
   },
   acceptButton: {
     backgroundColor: COLORS.accent,
@@ -616,7 +628,7 @@ const styles = StyleSheet.create({
   },
   acceptText: {
     color: '#fff',
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: '500',
   },
   declineButton: {
@@ -628,17 +640,17 @@ const styles = StyleSheet.create({
   },
   declineText: {
     color: COLORS.secondary,
-    fontSize: 12,
+    fontSize: 14,
   },
   emptyLabel: {
     color: COLORS.secondary,
-    fontSize: 12,
+    fontSize: 14,
     fontFamily: STAMP_FONT,
     opacity: 0.7,
   },
   requestsEmptyText: {
     color: '#7A5C4D',
-    fontSize: 12,
+    fontSize: 14,
     fontFamily: STAMP_FONT,
   },
   hereTooThumb: {
@@ -666,7 +678,7 @@ const styles = StyleSheet.create({
   },
   approvedFlashText: {
     color: COLORS.accent,
-    fontSize: 11,
+    fontSize: 13,
     fontFamily: STAMP_FONT,
     letterSpacing: 0.4,
   },

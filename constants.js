@@ -25,6 +25,8 @@ export const RecordingContext = createContext({
   removePendingClip: () => {},
   isStripOpen: false,
   setIsStripOpen: () => {},
+  profile: null,
+  setProfile: () => {},
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -125,14 +127,14 @@ export const stampStyles = StyleSheet.create({
     fontSize: 19,
     fontWeight: '500',
     letterSpacing: 0.95,
-    color: COLORS.accent,
+    color: '#F5F1E8',
   },
   coords: {
     fontFamily: STAMP_FONT,
     fontSize: 16,
     fontWeight: '400',
     letterSpacing: 0.64,
-    color: COLORS.accent,
+    color: '#F5F1E8',
     opacity: 0.85,
   },
   bottomStamp: {
