@@ -1,7 +1,8 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Animated, Modal, PanResponder, Pressable, Share, StyleSheet, Text, View } from 'react-native';
+import { Alert, ActivityIndicator, Animated, Modal, PanResponder, Pressable, Share, StyleSheet, Text, View } from 'react-native';
+import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from './supabase';
 import VideoStamp from './components/VideoStamp';
 
@@ -18,6 +19,7 @@ export default function VideoPlayer({ clip, clips, onClose, onDelete }) {
   const startIndex = clips ? Math.max(0, clips.findIndex(c => c.id === clip.id)) : 0;
   const [currentIndex, setCurrentIndex] = useState(startIndex);
   const [isPlaying, setIsPlaying] = useState(true);
+  const [isSharing, setIsSharing] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [localClips, setLocalClips] = useState(clips ?? null);
 
@@ -111,10 +113,17 @@ export default function VideoPlayer({ clip, clips, onClose, onDelete }) {
   })).current;
 
   const handleShare = async () => {
+    if (isSharing) return;
+    const tempPath = FileSystem.cacheDirectory + 'share_clip.mp4';
+    setIsSharing(true);
     try {
-      await Share.share({ url: activeClip.playbackUri });
+      const { uri } = await FileSystem.downloadAsync(activeClip.playbackUri, tempPath);
+      await Share.share({ url: uri });
     } catch (err) {
       console.error('Share failed:', err.message);
+    } finally {
+      setIsSharing(false);
+      await FileSystem.deleteAsync(tempPath, { idempotent: true });
     }
   };
 
@@ -208,13 +217,15 @@ export default function VideoPlayer({ clip, clips, onClose, onDelete }) {
                 <View style={s.sheetHandle} />
               </View>
 
-              <Pressable style={s.sheetRow} onPress={handleShare}>
+              <Pressable style={s.sheetRow} onPress={handleShare} disabled={isSharing}>
                 <View style={s.shareIcon}>
-                  <Ionicons name="share-outline" size={18} color={TERRACOTTA} />
+                  {isSharing
+                    ? <ActivityIndicator size="small" color={TERRACOTTA} />
+                    : <Ionicons name="share-outline" size={18} color={TERRACOTTA} />}
                 </View>
                 <View>
                   <Text style={s.rowLabel}>share moment</Text>
-                  <Text style={s.rowSub}>send to instagram, messages...</Text>
+                  <Text style={s.rowSub}>{isSharing ? 'preparing...' : 'send to instagram, messages...'}</Text>
                 </View>
               </Pressable>
 

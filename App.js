@@ -7,11 +7,13 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { COLORS, RecordingContext } from './constants';
 import { supabase } from './supabase';
-import AuthScreen from './AuthScreen';
 import CameraScreen from './CameraScreen';
 import FeedScreen from './FeedScreen';
 import MapScreen from './MapScreen';
 import FriendProfileScreen from './FriendProfileScreen';
+import OnboardingNavigator from './screens/onboarding/OnboardingNavigator';
+
+const FORCE_ONBOARDING = false;
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -113,6 +115,7 @@ function TabNavigator() {
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [session, setSession] = useState(undefined);
+  const [onboarded, setOnboarded] = useState(undefined);
   const [pendingClips, setPendingClips] = useState([]);
   const [isStripOpen, setIsStripOpen] = useState(false);
   const [profile, setProfile] = useState(null);
@@ -129,34 +132,55 @@ export default function App() {
     setPendingClips(prev => prev.filter(c => c.localId !== localId));
   }, []);
 
+  async function loadProfile(user) {
+    const { data } = await supabase.from('profiles').select('*').eq('id', user.id).single();
+    if (data) {
+      setProfile(data);
+      // Treat as onboarded if the flag is true OR if they already have a username
+      // (handles accounts created before the onboarded flag was being set)
+      setOnboarded(data.onboarded === true || !!data.username);
+    } else {
+      setOnboarded(false);
+    }
+  }
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session ?? null);
       if (session?.user) {
-        supabase.from('profiles').select('*').eq('id', session.user.id).single()
-          .then(({ data }) => { if (data) setProfile(data); });
+        loadProfile(session.user);
+      } else {
+        setOnboarded(null);
       }
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session ?? null);
       if (session?.user) {
-        supabase.from('profiles').select('*').eq('id', session.user.id).single()
-          .then(({ data }) => { if (data) setProfile(data); });
+        loadProfile(session.user);
       } else {
         setProfile(null);
+        setOnboarded(null);
       }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  if (session === undefined) {
+  // Wait until session and onboarded status are both resolved
+  const loading = session === undefined || (session !== null && onboarded === undefined);
+  if (loading) {
     return <View style={{ flex: 1, backgroundColor: COLORS.background }} />;
   }
 
-  if (session === null) {
-    return <AuthScreen onAuth={() => {}} />;
+  const showOnboarding = FORCE_ONBOARDING || session === null || !onboarded;
+
+  if (showOnboarding) {
+    return (
+      <NavigationContainer>
+        <OnboardingNavigator />
+      </NavigationContainer>
+    );
   }
 
   return (
